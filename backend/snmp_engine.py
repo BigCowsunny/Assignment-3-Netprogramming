@@ -401,6 +401,8 @@ async def snmp_poll_octets(
                     if if_idx not in results:
                         results[if_idx] = {}
                     results[if_idx]["out_octets"] = val
+                except Exception:
+                    pass
 
         # Old switches and some EVE images expose only the 32-bit IF-MIB counters.
         missing_in = [idx for idx in (if_indices or []) if results.get(idx, {}).get("in_octets") is None]
@@ -440,9 +442,6 @@ async def snmp_poll_octets(
                         results[if_idx].setdefault("out_octets", int(vb[1]))
                     except Exception:
                         pass
-                except Exception:
-                    pass
-
     except Exception as e:
         logger.warning(f"Octet poll failed for {ip}: {e}")
 
