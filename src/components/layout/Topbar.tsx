@@ -1,0 +1,57 @@
+import React, { useEffect, useState } from 'react';
+import { useSnmp } from '../../context/SnmpContext';
+import { Icon } from '../common/Icons';
+import { pad } from '../../utils/formatters';
+
+export const Topbar: React.FC = () => {
+  const { searchQuery, setSearchQuery, setView } = useSnmp();
+  const [time, setTime] = useState<string>('00:00:00');
+
+  useEffect(() => {
+    const updateTime = () => {
+      const now = new Date();
+      setTime(`${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`);
+    };
+    updateTime();
+    const interval = setInterval(updateTime, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      setView('devices');
+    }
+  };
+
+  return (
+    <header className="topbar">
+      <div className="brand">
+        <span className="mark">
+          <Icon name="i-topo" />
+        </span>
+        SNMP Network Monitor <small>v1.0</small>
+      </div>
+
+      <span className="demo-badge">โหมดสาธิต · ข้อมูลจำลอง</span>
+
+      <div className="spacer"></div>
+
+      <label className="gsearch">
+        <Icon name="i-search" />
+        <input
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="ค้นหาชื่อ / IP อุปกรณ์"
+          aria-label="ค้นหาอุปกรณ์"
+        />
+      </label>
+
+      <span className="live-chip">
+        <span className="dot"></span>WebSocket เชื่อมต่อแล้ว
+      </span>
+
+      <span id="clock">{time}</span>
+    </header>
+  );
+};
