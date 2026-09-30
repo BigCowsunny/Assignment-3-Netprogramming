@@ -8,7 +8,7 @@ import socket
 import ipaddress
 from typing import List, Dict, Optional
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 logger = logging.getLogger("network_scanner")
 
@@ -133,7 +133,7 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
     import urllib.request
     import json
     
-    raw_host = host.strip()
+    raw_host = host.strip().rstrip("/")
     parsed_host = urlsplit(raw_host if "://" in raw_host else f"http://{raw_host}")
     clean_host = parsed_host.hostname or ""
     if not clean_host:
@@ -153,59 +153,82 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
                 handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
             opener = urllib.request.build_opener(*handlers)
             
-            # 1. Login
+            # 1. Login (html5 is only needed by EVE-NG Pro over HTTPS).
             login_url = f"{url_base}/api/auth/login"
-            payload = json.dumps({"username": username, "password": password, "html5": "-1"}).encode('utf-8')
+            login_payload = {"username": username, "password": password}
+            if parsed_host.scheme == "https":
+                login_payload["html5"] = "0"
+            payload = json.dumps(login_payload).encode('utf-8')
             req = urllib.request.Request(login_url, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
-            with opener.open(req, timeout=2.0) as res:
+            with opener.open(req, timeout=8.0) as res:
                 res_data = json.loads(res.read().decode('utf-8'))
-                if res_data.get("code") != 200 and res_data.get("status") != "success":
-                    return []
+                if str(res_data.get("code")) != "200" and res_data.get("status") != "success":
+                    raise RuntimeError(f"EVE-NG login failed: {res_data.get('message', 'ตรวจสอบ username/password')}")
             
-            # 2. Get active folders/labs
-            labs_url = f"{url_base}/api/folders"
-            req_labs = urllib.request.Request(labs_url, method='GET')
+            # 2. Read the logged-in user's root folder, then walk nested folders.
+            auth_req = urllib.request.Request(f"{url_base}/api/auth", headers={'Content-Type': 'application/json'}, method='GET')
+            with opener.open(auth_req, timeout=8.0) as res:
+                auth_data = json.loads(res.read().decode('utf-8'))
+            if auth_data.get("status") != "success":
+                raise RuntimeError(f"EVE-NG auth check failed: {auth_data.get('message', 'session ไม่ถูกต้อง')}")
+            user_data = auth_data.get("data", {})
+            root_folder = user_data.get("folder") or "/"
+            if not root_folder.startswith("/"):
+                root_folder = "/" + root_folder
+
             lab_files = []
-            try:
-                with opener.open(req_labs, timeout=2.0) as res:
+            pending_folders = [root_folder]
+            visited_folders = set()
+            while pending_folders:
+                folder_path = pending_folders.pop(0)
+                if folder_path in visited_folders:
+                    continue
+                visited_folders.add(folder_path)
+                encoded_folder = quote(folder_path.strip("/"), safe="/")
+                folder_url = f"{url_base}/api/folders/{encoded_folder}" if encoded_folder else f"{url_base}/api/folders/"
+                req_folder = urllib.request.Request(folder_url, headers={'Content-Type': 'application/json'}, method='GET')
+                with opener.open(req_folder, timeout=8.0) as res:
                     folder_data = json.loads(res.read().decode('utf-8'))
-                    data = folder_data.get("data", {})
-                    labs = data.get("labs", data.get("folders", [])) if isinstance(data, dict) else []
-                    if isinstance(labs, dict):
-                        labs = list(labs.values())
-                    for lab in labs if isinstance(labs, list) else []:
-                        if isinstance(lab, dict):
-                            lab_files.append(lab.get("path") or lab.get("name"))
-                        elif isinstance(lab, str):
-                            lab_files.append(lab)
-            except Exception:
-                pass
+                if folder_data.get("status") != "success":
+                    raise RuntimeError(f"EVE-NG folder listing failed: {folder_data.get('message', folder_path)}")
+                data = folder_data.get("data", {})
+                if not isinstance(data, dict):
+                    continue
+                for lab in data.get("labs", []) or []:
+                    lab_path = lab.get("path") if isinstance(lab, dict) else lab if isinstance(lab, str) else None
+                    if lab_path:
+                        lab_files.append(lab_path)
+                for folder in data.get("folders", []) or []:
+                    child_path = folder.get("path") if isinstance(folder, dict) else folder if isinstance(folder, str) else None
+                    if child_path and child_path != "..":
+                        if not child_path.startswith("/"):
+                            child_path = f"{folder_path.rstrip('/')}/{child_path}"
+                        pending_folders.append(child_path)
                 
-            if not lab_files:
-                lab_files = ["/"]
-                
-            # 3. Get nodes from each lab
+            # 3. Read nodes from all labs, including labs nested under folders.
             nodes_found = []
-            for lab_path in lab_files:
-                if not lab_path:
+            for lab_path in dict.fromkeys(lab_files):
+                path_clean = quote(str(lab_path).strip('/'), safe="/")
+                if not path_clean:
                     continue
-                path_clean = lab_path.strip('/')
-                node_path = f"/api/labs/{path_clean}/nodes" if path_clean else "/api/labs/nodes"
+                node_path = f"/api/labs/{path_clean}/nodes"
                 node_url = f"{url_base}{node_path}"
-                try:
-                    req_nodes = urllib.request.Request(node_url, method='GET')
-                    with opener.open(req_nodes, timeout=2.0) as res:
-                        nodes_resp = json.loads(res.read().decode('utf-8'))
-                        nodes_dict = nodes_resp.get("data", {})
-                        if isinstance(nodes_dict, dict):
-                            for n_id, n_data in nodes_dict.items():
-                                nodes_found.append(n_data)
-                except Exception:
+                req_nodes = urllib.request.Request(node_url, headers={'Content-Type': 'application/json'}, method='GET')
+                with opener.open(req_nodes, timeout=8.0) as res:
+                    nodes_resp = json.loads(res.read().decode('utf-8'))
+                if nodes_resp.get("status") != "success":
                     continue
+                nodes_dict = nodes_resp.get("data", {})
+                if isinstance(nodes_dict, dict):
+                    for n_id, n_data in nodes_dict.items():
+                        if isinstance(n_data, dict):
+                            n_data.setdefault("id", n_id)
+                            n_data.setdefault("lab_path", lab_path)
+                            nodes_found.append(n_data)
             return nodes_found
         except Exception as e:
-            logger.debug(f"EVE-NG API scan error for {clean_host}: {e}")
-            return []
+            logger.warning(f"EVE-NG API scan error for {clean_host}: {e}")
+            raise RuntimeError(f"เชื่อมต่อ EVE-NG API ไม่สำเร็จ: {e}") from e
 
     try:
         nodes = await asyncio.to_thread(sync_api_call)
@@ -239,7 +262,8 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
                 "method": "eveng_api"
             })
     except Exception as e:
-        logger.debug(f"EVE-NG API thread error: {e}")
+        logger.warning(f"EVE-NG API thread error for {clean_host}: {e}")
+        raise
 
     return devices
 
@@ -325,7 +349,7 @@ async def scan_eveng_ports(
     
     # 1. Try EVE-NG REST API
     try:
-        api_devices = await scan_eveng_api(clean_host, username, password)
+        api_devices = await scan_eveng_api(host, username, password)
         if api_devices:
             logger.info(f"  ✓ Found {len(api_devices)} nodes via EVE-NG REST API")
             for dev in api_devices:
@@ -333,7 +357,8 @@ async def scan_eveng_ports(
                 if dev.get("port"):
                     seen_ports.add(dev["port"])
     except Exception as e:
-        logger.debug(f"EVE-NG REST API error: {e}")
+        logger.warning(f"EVE-NG REST API error: {e}")
+        api_error = e
                 
     # 2. Scan Telnet console ports
     try:
@@ -349,6 +374,9 @@ async def scan_eveng_ports(
     except Exception as e:
         logger.debug(f"Telnet port sweep error: {e}")
                 
+    if not devices and 'api_error' in locals():
+        raise RuntimeError(str(api_error))
+
     logger.info(f"EVE-NG scan complete: {len(devices)} total devices found")
     return devices
 

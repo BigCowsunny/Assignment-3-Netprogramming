@@ -60,7 +60,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
         <b>{port.name}</b>
         <div className="hint">
           {fmtSpeed(port.speed)} · ifIndex {port.idx} ·{' '}
-          {device.rw ? 'community RW' : 'community RO'}
+          ทดลอง SET และตรวจค่าจากอุปกรณ์
         </div>
       </div>
 

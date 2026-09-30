@@ -137,31 +137,41 @@ async def snmp_set_admin_status(
             return {"ok": False, "error": f"SNMP Error: {status_str}"}
 
         # Read back to verify
-        read_error, _, _, read_vbs = await get_cmd(
+        read_error, read_status, read_index, read_vbs = await get_cmd(
             engine,
             CommunityData(community),
             transport,
             ContextData(),
             ObjectType(ObjectIdentity(oid_target)),
+        )
+        if read_error:
+            return {"ok": False, "error": f"ส่ง SNMP SET แล้ว แต่อ่าน ifAdminStatus กลับมาตรวจไม่ได้: {read_error}"}
+        if read_status:
+            return {"ok": False, "error": f"อ่าน ifAdminStatus กลับมาตรวจไม่ได้: {read_status.prettyPrint()} at {read_index}"}
+        if not read_vbs:
+            return {"ok": False, "error": "อุปกรณ์ไม่ส่งค่า ifAdminStatus กลับมาตรวจ"}
+
+        verified_admin = int(read_vbs[0][1])
+        admin_res = "up" if verified_admin == 1 else "down"
+        expected_admin = "up" if status_code == 1 else "down"
+        if admin_res != expected_admin:
+            return {"ok": False, "error": f"อุปกรณ์ยังรายงาน ifAdminStatus={admin_res} หลังสั่ง {expected_admin}"}
+
+        oper_res = None
+        oper_error, oper_status_error, _, oper_vbs = await get_cmd(
+            engine, CommunityData(community), transport, ContextData(),
             ObjectType(ObjectIdentity(f"{OID_IF_OPER_STATUS}.{if_index}")),
         )
-
-        admin_res = "up" if status_code == 1 else "down"
-        oper_res = admin_res
-        if not read_error and read_vbs:
+        if not oper_error and not oper_status_error and oper_vbs:
             try:
-                verified_admin = int(read_vbs[0][1])
-                admin_res = "up" if verified_admin == 1 else "down"
-                if len(read_vbs) > 1:
-                    verified_oper = int(read_vbs[1][1])
-                    oper_res = "up" if verified_oper == 1 else "down"
+                oper_res = "up" if int(oper_vbs[0][1]) == 1 else "down"
             except Exception:
                 pass
 
         return {
             "ok": True,
             "admin": admin_res,
-            "oper": oper_res,
+            **({"oper": oper_res} if oper_res else {}),
             "oid": oid_target,
             "value": status_code
         }
@@ -274,6 +284,58 @@ async def snmp_walk_interfaces(
                     except Exception:
                         pass
 
+        # Supplement ifDescr with ifName, ifAlias, physical address, and errors.
+        # Some agents do not implement every optional IF-MIB column, so a
+        # failed walk should leave the successfully read columns intact.
+        optional_columns = (
+            (OID_IF_NAME, "name"),
+            (OID_IF_ALIAS, "alias"),
+            (OID_IF_PHYS_ADDR, "mac"),
+            (OID_IF_IN_ERRORS, "in_errors"),
+            (OID_IF_OUT_ERRORS, "out_errors"),
+        )
+        for base_oid, field in optional_columns:
+            try:
+                async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+                    engine,
+                    CommunityData(community),
+                    transport,
+                    ContextData(),
+                    ObjectType(ObjectIdentity(base_oid)),
+                    lexicographicMode=False,
+                ):
+                    if errorIndication or errorStatus:
+                        break
+                    for vb in varBinds:
+                        if_idx = int(str(vb[0]).split(".")[-1])
+                        if if_idx not in interfaces:
+                            continue
+                        value = vb[1]
+                        if field == "mac":
+                            try:
+                                raw_mac = bytes(value)
+                                interfaces[if_idx][field] = ":".join(f"{octet:02x}" for octet in raw_mac)
+                            except Exception:
+                                interfaces[if_idx][field] = str(value)
+                        elif field in ("in_errors", "out_errors"):
+                            try:
+                                interfaces[if_idx][field] = int(value)
+                            except Exception:
+                                pass
+                        else:
+                            text_value = str(value).strip()
+                            if text_value:
+                                interfaces[if_idx][field] = text_value
+            except Exception as column_error:
+                logger.debug(f"Optional interface column {base_oid} unavailable on {ip}: {column_error}")
+
+        for interface in interfaces.values():
+            if interface.get("name"):
+                interface["alias"] = interface.get("alias") or interface["name"]
+            interface["errors"] = interface.pop("in_errors", 0) + interface.pop("out_errors", 0)
+            name_lower = interface["name"].lower()
+            interface["virtual"] = interface["virtual"] or any(token in name_lower for token in ("loopback", "null", "vlan", "tunnel"))
+
     except Exception as e:
         logger.warning(f"Interface walk failed for {ip}: {e}")
 
@@ -339,6 +401,45 @@ async def snmp_poll_octets(
                     if if_idx not in results:
                         results[if_idx] = {}
                     results[if_idx]["out_octets"] = val
+
+        # Old switches and some EVE images expose only the 32-bit IF-MIB counters.
+        missing_in = [idx for idx in (if_indices or []) if results.get(idx, {}).get("in_octets") is None]
+        if missing_in:
+            async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+                engine, CommunityData(community), transport, ContextData(),
+                ObjectType(ObjectIdentity(OID_IF_IN_OCTETS)), lexicographicMode=False,
+            ):
+                if errorIndication or errorStatus:
+                    break
+                for vb in varBinds:
+                    if_idx = int(str(vb[0]).split(".")[-1])
+                    if if_indices and if_idx not in if_indices:
+                        continue
+                    if if_idx not in results:
+                        results[if_idx] = {}
+                    try:
+                        results[if_idx].setdefault("in_octets", int(vb[1]))
+                    except Exception:
+                        pass
+
+        missing_out = [idx for idx in (if_indices or []) if results.get(idx, {}).get("out_octets") is None]
+        if missing_out:
+            async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+                engine, CommunityData(community), transport, ContextData(),
+                ObjectType(ObjectIdentity(OID_IF_OUT_OCTETS)), lexicographicMode=False,
+            ):
+                if errorIndication or errorStatus:
+                    break
+                for vb in varBinds:
+                    if_idx = int(str(vb[0]).split(".")[-1])
+                    if if_indices and if_idx not in if_indices:
+                        continue
+                    if if_idx not in results:
+                        results[if_idx] = {}
+                    try:
+                        results[if_idx].setdefault("out_octets", int(vb[1]))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 

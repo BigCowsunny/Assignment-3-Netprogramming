@@ -30,9 +30,10 @@ async def poll_device_metrics(device: dict):
     ip = device["ip"]
     community = device.get("community", "public")
     ver = device.get("ver", "v2c")
+    snmp_port = int(device.get("snmp_port", 161) or 161)
 
     # 1. Check device liveness via sysUpTime (FR-1.5)
-    sys_info = await snmp_get_system_info(ip, community, timeout=1.5)
+    sys_info = await snmp_get_system_info(ip, community, port=snmp_port, timeout=1.5)
     is_online = sys_info.get("ok", False)
     new_status = "online" if is_online else "offline"
 
@@ -64,7 +65,7 @@ async def poll_device_metrics(device: dict):
         return
 
     active_indices = [p["idx"] for p in ports if not p.get("virtual")]
-    octets_data = await snmp_poll_octets(ip, community, if_indices=active_indices)
+    octets_data = await snmp_poll_octets(ip, community, port=snmp_port, if_indices=active_indices)
     now = time.time()
 
     for port in ports:

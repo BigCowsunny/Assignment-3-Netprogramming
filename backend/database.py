@@ -32,6 +32,7 @@ def init_db():
         ip TEXT NOT NULL UNIQUE,
         snmp_version TEXT DEFAULT 'v2c',
         community TEXT DEFAULT 'public',
+        snmp_port INTEGER DEFAULT 161,
         device_type TEXT DEFAULT 'switch',
         vendor TEXT,
         sys_descr TEXT,
@@ -106,6 +107,10 @@ def init_db():
     );
     """)
 
+    device_columns = {row[1] for row in cursor.execute("PRAGMA table_info(devices)").fetchall()}
+    if "snmp_port" not in device_columns:
+        cursor.execute("ALTER TABLE devices ADD COLUMN snmp_port INTEGER DEFAULT 161")
+
     # Default settings
     cursor.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('poll_interval', '60')")
     cursor.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('retry_enabled', 'true')")
@@ -113,11 +118,7 @@ def init_db():
 
     conn.commit()
 
-    # Check if empty, seed initial lab data so app works immediately
-    cursor.execute("SELECT COUNT(*) as cnt FROM devices")
-    if cursor.fetchone()["cnt"] == 0:
-        seed_initial_data(conn)
-
+    # A fresh database starts empty; inventory and history must come from real SNMP.
     conn.close()
 
 
@@ -287,11 +288,11 @@ def save_device(dev: Dict[str, Any]):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT OR REPLACE INTO devices (id, name, ip, snmp_version, community, device_type, vendor, sys_descr, status, up_time, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    INSERT OR REPLACE INTO devices (id, name, ip, snmp_version, community, snmp_port, device_type, vendor, sys_descr, status, up_time, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         dev["id"], dev["name"], dev["ip"], dev.get("ver", dev.get("snmp_version", "v2c")),
-        dev.get("community", "public"), dev.get("type", dev.get("device_type", "switch")),
+        dev.get("community", "public"), dev.get("snmp_port", dev.get("port", 161)), dev.get("type", dev.get("device_type", "switch")),
         dev.get("vendor", ""), dev.get("descr", dev.get("sys_descr", "")),
         dev.get("status", "online"), dev.get("up", dev.get("up_time", ""))
     ))
@@ -317,7 +318,26 @@ def delete_device(dev_id: str):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM traffic_samples WHERE device_id = ?", (dev_id,))
     cursor.execute("DELETE FROM interfaces WHERE device_id = ?", (dev_id,))
+    cursor.execute("DELETE FROM topology_links WHERE device_a = ? OR device_b = ?", (dev_id, dev_id))
     cursor.execute("DELETE FROM devices WHERE id = ?", (dev_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_topology_link(device_a: str, port_a: str, device_b: str, port_b: str, protocol: str):
+    """Persist a neighbor relationship discovered from LLDP or CDP."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """DELETE FROM topology_links WHERE
+           (device_a = ? AND port_a = ? AND device_b = ? AND port_b = ?) OR
+           (device_a = ? AND port_a = ? AND device_b = ? AND port_b = ?)""",
+        (device_a, port_a, device_b, port_b, device_b, port_b, device_a, port_a),
+    )
+    cursor.execute(
+        "INSERT INTO topology_links (id, device_a, port_a, device_b, port_b, protocol) VALUES (?, ?, ?, ?, ?, ?)",
+        (f"link_{device_a}_{port_a}_{device_b}_{port_b}", device_a, port_a, device_b, port_b, protocol),
+    )
     conn.commit()
     conn.close()
 
@@ -403,15 +423,67 @@ def get_traffic_history(device_id: str, port_name: str, range_type: str = "day")
     }
     threshold = now_ms - range_ms_map.get(range_type, 24 * 60 * 60 * 1000)
 
+    bucket_ms_map = {
+        "live": 5_000,
+        "day": 300_000,
+        "week": 1_800_000,
+        "month": 7_200_000,
+        "year": 86_400_000,
+    }
+    bucket_ms = bucket_ms_map.get(range_type, bucket_ms_map["day"])
     cursor.execute("""
-    SELECT timestamp, in_bps, out_bps FROM traffic_samples
+    SELECT (timestamp / ?) * ? AS timestamp, AVG(in_bps) AS in_bps, AVG(out_bps) AS out_bps
+    FROM traffic_samples
     WHERE device_id = ? AND port_name = ? AND timestamp >= ?
+    GROUP BY (timestamp / ?) * ?
     ORDER BY timestamp ASC
-    """, (device_id, port_name, threshold))
+    """, (bucket_ms, bucket_ms, device_id, port_name, threshold, bucket_ms, bucket_ms))
 
     rows = cursor.fetchall()
     conn.close()
     return [{"t": r["timestamp"], "in": r["in_bps"], "out": r["out_bps"]} for r in rows]
+
+
+def get_aggregate_traffic(range_type: str = "day") -> List[Dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    range_ms_map = {
+        "live": 10 * 60 * 1000,
+        "day": 24 * 60 * 60 * 1000,
+        "week": 7 * 24 * 60 * 60 * 1000,
+        "month": 30 * 24 * 60 * 60 * 1000,
+        "year": 365 * 24 * 60 * 60 * 1000,
+    }
+    bucket_ms_map = {"live": 5_000, "day": 300_000, "week": 1_800_000, "month": 7_200_000, "year": 86_400_000}
+    threshold = now_ms - range_ms_map.get(range_type, range_ms_map["day"])
+    bucket_ms = bucket_ms_map.get(range_type, bucket_ms_map["day"])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT (timestamp / ?) * ? AS timestamp, SUM(in_bps) AS in_bps, SUM(out_bps) AS out_bps
+    FROM traffic_samples
+    WHERE timestamp >= ?
+    GROUP BY (timestamp / ?) * ?
+    ORDER BY timestamp ASC
+    """, (bucket_ms, bucket_ms, threshold, bucket_ms, bucket_ms))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"t": r["timestamp"], "in": r["in_bps"], "out": r["out_bps"]} for r in rows]
+
+
+def get_latest_traffic() -> List[Dict[str, Any]]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT s.device_id, s.port_name, s.timestamp, s.in_bps, s.out_bps
+    FROM traffic_samples s
+    INNER JOIN (
+      SELECT device_id, port_name, MAX(timestamp) AS latest
+      FROM traffic_samples GROUP BY device_id, port_name
+    ) latest ON latest.device_id = s.device_id AND latest.port_name = s.port_name AND latest.latest = s.timestamp
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def save_traffic_sample(device_id: str, port_name: str, in_octets: int, out_octets: int, in_bps: float, out_bps: float):

@@ -26,12 +26,14 @@ from database import (
     get_audit_logs,
     add_audit_log,
     get_traffic_history,
+    get_aggregate_traffic,
+    get_latest_traffic,
     get_db,
 )
 from snmp_engine import snmp_get_system_info, snmp_set_admin_status, snmp_walk_interfaces
 from trap_receiver import start_trap_listener, ws_manager
 from poller import run_poller_loop
-from discovery import discover_network
+from discovery import discover_network, discover_topology_links
 from network_scanner import scan_network, scan_eveng_ports
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -40,16 +42,19 @@ logger = logging.getLogger("main")
 # Background tasks
 _trap_transport = None
 _poller_task = None
+_trap_port: Optional[int] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _trap_transport, _poller_task
+    global _trap_transport, _poller_task, _trap_port
     logger.info("Initializing SQLite database...")
     init_db()
 
     logger.info("Starting SNMP Trap Receiver on UDP 162...")
     _trap_transport = await start_trap_listener(port=162)
+    if _trap_transport:
+        _trap_port = int(_trap_transport.get_extra_info("sockname")[1])
 
     logger.info("Starting Background SNMP Poller...")
     _poller_task = asyncio.create_task(run_poller_loop(poll_interval_seconds=60))
@@ -95,6 +100,7 @@ class DeviceUpdateRequest(BaseModel):
     ip: str
     snmp_version: str = "v2c"
     community: str = "public"
+    port: int = 161
     device_type: str = "switch"
     vendor: Optional[str] = ""
     status: Optional[str] = "online"
@@ -117,7 +123,7 @@ async def health_check():
     return {
         "status": "online",
         "service": "SNMP Network Monitor Backend",
-        "trap_port": 162,
+        "trap_port": _trap_port,
         "poller": "active",
         "timestamp": time.time()
     }
@@ -154,31 +160,18 @@ async def test_device_connection(req: DeviceCreateRequest):
 @app.post("/api/devices")
 async def create_device(req: DeviceCreateRequest):
     """FR-1.1, FR-1.3: Add device, probe interfaces, and save to DB"""
+    existing = get_device(req.ip)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"อุปกรณ์ IP {req.ip} ถูกเพิ่มไว้แล้ว")
+
     probe = await snmp_get_system_info(req.ip, req.community, req.port, timeout=2.5)
+    if not probe.get("ok"):
+        raise HTTPException(status_code=422, detail=f"เชื่อมต่อ SNMP ไม่สำเร็จที่ {req.ip}:{req.port}: {probe.get('error', 'timeout')}")
 
     # Walk interfaces from device
-    ports = []
-    if probe.get("ok"):
-        ports = await snmp_walk_interfaces(req.ip, req.community, req.port)
-
-    # Fallback default ports if real switch walk returned empty
+    ports = await snmp_walk_interfaces(req.ip, req.community, req.port)
     if not ports:
-        if req.device_type == "switch":
-            for i in range(1, 25):
-                ports.append({
-                    "idx": i, "name": f"Fa0/{i}", "speed": 100,
-                    "admin": "up", "oper": "up" if i in (1, 2, 5, 7) else "down",
-                    "errors": 0, "mac": f"00:1e:bd:{i:02x}:20:aa", "alias": f"FastEthernet 0/{i}",
-                    "virtual": False, "ip": ""
-                })
-            ports.append({"idx": 25, "name": "Gi0/1", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:1e:bd:fe:20:01", "alias": "GigabitEthernet 0/1", "virtual": False, "ip": ""})
-            ports.append({"idx": 26, "name": "Gi0/2", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:1e:bd:fe:20:02", "alias": "GigabitEthernet 0/2", "virtual": False, "ip": ""})
-        else:
-            ports = [
-                {"idx": 1, "name": "GigabitEthernet0/0", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:50:56:c1:01:01", "alias": "WAN", "virtual": False, "ip": f"{req.ip}/24"},
-                {"idx": 2, "name": "GigabitEthernet0/1", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:50:56:c1:01:02", "alias": "LAN", "virtual": False, "ip": "10.0.0.1/24"},
-                {"idx": 3, "name": "GigabitEthernet0/2", "speed": 1000, "admin": "up", "oper": "down", "errors": 0, "mac": "00:50:56:c1:01:03", "alias": "DMZ", "virtual": False, "ip": "172.16.0.1/24"},
-            ]
+        raise HTTPException(status_code=422, detail=f"SNMP ตอบกลับที่ {req.ip}:{req.port} แต่ดึง interface ไม่ได้ ตรวจสอบสิทธิ์ community และ IF-MIB")
 
     dev_id = f"d_{int(time.time()*1000)}"
     dev_name = req.name or probe.get("name") or f"Device-{req.ip}"
@@ -196,6 +189,7 @@ async def create_device(req: DeviceCreateRequest):
         "ip": req.ip,
         "ver": req.snmp_version,
         "community": req.community,
+        "snmp_port": req.port,
         "type": req.device_type,
         "vendor": vendor,
         "descr": probe.get("descr", "SNMP Monitored Node"),
@@ -224,15 +218,26 @@ async def update_single_device(device_id: str, req: DeviceUpdateRequest):
     if not dev:
         raise HTTPException(status_code=404, detail="Device not found")
 
+    probe = await snmp_get_system_info(req.ip, req.community, req.port, timeout=2.5)
+    if not probe.get("ok"):
+        raise HTTPException(status_code=422, detail=f"เชื่อมต่อ SNMP ไม่สำเร็จที่ {req.ip}:{req.port}: {probe.get('error', 'timeout')}")
+    ports = await snmp_walk_interfaces(req.ip, req.community, req.port)
+    if not ports:
+        raise HTTPException(status_code=422, detail=f"SNMP ตอบกลับที่ {req.ip}:{req.port} แต่ดึง interface ไม่ได้")
+
     dev["name"] = req.name
     dev["ip"] = req.ip
     dev["snmp_version"] = req.snmp_version
     dev["ver"] = req.snmp_version
     dev["community"] = req.community
+    dev["snmp_port"] = req.port
     dev["device_type"] = req.device_type
     dev["type"] = req.device_type
     dev["vendor"] = req.vendor or dev["vendor"]
     dev["status"] = req.status or dev["status"]
+    dev["ports"] = ports
+    dev["up"] = probe.get("uptime", dev.get("up", ""))
+    dev["descr"] = probe.get("descr", dev.get("descr", ""))
 
     save_device(dev)
     add_audit_log("admin", f"แก้ไขอุปกรณ์ {req.name}", req.ip, "สำเร็จ")
@@ -274,13 +279,8 @@ async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAd
     port = next((p for p in dev.get("ports", []) if p["name"] == port_name), None)
     if not port:
         raise HTTPException(status_code=404, detail="Port not found")
-
-    if not dev.get("rw", True) and dev.get("community") != "private":
-        add_audit_log("admin", f"สั่ง {req.status.capitalize()} {port_name}", dev["name"], "ล้มเหลว (RO)")
-        return {
-            "ok": False,
-            "error": "SNMP SET ล้มเหลว: community เป็น read-only · noSuchName · ifAdminStatus"
-        }
+    if req.status not in ("up", "down"):
+        raise HTTPException(status_code=422, detail="status must be 'up' or 'down'")
 
     status_code = 1 if req.status == "up" else 2
 
@@ -290,12 +290,16 @@ async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAd
         community=dev.get("community", "private"),
         if_index=port["idx"],
         status_code=status_code,
-        port=161
+        port=dev.get("snmp_port", 161)
     )
 
-    # In lab or when real hardware is unreachable, update DB state gracefully
-    new_admin = req.status
-    new_oper = req.status
+    if not res.get("ok"):
+        add_audit_log("admin", f"สั่ง {('Shutdown' if req.status == 'down' else 'No Shutdown')} {port_name}", dev["name"], "ล้มเหลว")
+        return {"ok": False, "error": res.get("error", "SNMP SET failed"), "snmp_detail": res}
+
+    # Persist only the state read back from the actual device.
+    new_admin = res.get("admin", req.status)
+    new_oper = res.get("oper", port["oper"])
 
     update_interface_status(device_id, port_name, admin=new_admin, oper=new_oper)
     add_audit_log("admin", f"สั่ง {('Shutdown' if req.status == 'down' else 'No Shutdown')} {port_name}", dev["name"], "สำเร็จ")
@@ -325,6 +329,16 @@ async def get_port_traffic(device_id: str, port_name: str, range: str = Query("d
     return get_traffic_history(device_id, port_name, range)
 
 
+@app.get("/api/traffic/aggregate")
+async def get_traffic_aggregate(range: str = Query("day")):
+    return get_aggregate_traffic(range)
+
+
+@app.get("/api/traffic/latest")
+async def get_latest_traffic_endpoint():
+    return get_latest_traffic()
+
+
 @app.get("/api/events")
 async def list_events(device: Optional[str] = None, type: Optional[str] = None, limit: int = 80):
     """FR-5.4, FR-5.5: Event Log table from SNMP traps"""
@@ -338,51 +352,34 @@ async def list_events(device: Optional[str] = None, type: Optional[str] = None, 
 
 @app.post("/api/events/test-trap")
 async def trigger_test_trap():
-    """Trigger a real test Trap directly from backend to test receiver & WS broadcast"""
-    devices = get_all_devices()
-    onlines = [d for d in devices if d.get("status") == "online"]
-    if not onlines:
-        return {"ok": False, "error": "No online devices"}
-
-    dev = onlines[0]
-    ports = [p for p in dev.get("ports", []) if not p.get("virtual")]
-    port = ports[0] if ports else {"idx": 1, "name": "Gi0/1"}
-
-    trap_type = "linkDown" if port["oper"] == "up" else "linkUp"
-    new_oper = "down" if trap_type == "linkDown" else "up"
-
-    update_interface_status(dev["id"], port["name"], oper=new_oper)
-
-    evt_id = f"e_{int(time.time()*1000)}"
-    oid = "1.3.6.1.6.3.1.1.5.3" if trap_type == "linkDown" else "1.3.6.1.6.3.1.1.5.4"
-
-    database.add_event(
-        evt_id=evt_id,
-        device_id=dev["id"],
-        source_ip=dev["ip"],
-        port_name=port["name"],
-        trap_type=trap_type,
-        oid=oid,
-        raw_varbinds=f'{{"ifIndex": {port["idx"]}, "ifOperStatus": "{new_oper}"}}'
+    """Send a real SNMPv2c notification to the local UDP Trap Receiver."""
+    if not _trap_port:
+        return {"ok": False, "error": "SNMP Trap Receiver is not listening; check UDP 162/1162 availability."}
+    from pysnmp.hlapi.v3arch.asyncio import (
+        SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+        NotificationType, ObjectIdentity, ObjectType, send_notification,
     )
+    from pysnmp.proto.rfc1902 import Integer32, OctetString
 
-    evt_payload = {
-        "type": "TRAP_EVENT",
-        "event": {
-            "id": evt_id,
-            "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "dev": dev["id"],
-            "dev_name": dev["name"],
-            "src": dev["ip"],
-            "port": port["name"],
-            "type": trap_type,
-            "oid": oid,
-            "oper": new_oper,
-            "isNew": True
-        }
-    }
-    await ws_manager.broadcast(evt_payload)
-    return {"ok": True, "event": evt_payload["event"]}
+    try:
+        transport = await UdpTransportTarget.create(("127.0.0.1", _trap_port), timeout=2.0, retries=0)
+        error_indication, error_status, _, _ = await send_notification(
+            SnmpEngine(), CommunityData("public"), transport, ContextData(), "trap",
+            NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.4")).add_varbinds(
+                ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.1.1"), Integer32(1)),
+                ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.7.1"), Integer32(1)),
+                ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.8.1"), Integer32(1)),
+                ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.2.1"), OctetString("TestInterface")),
+            )
+        )
+        if error_indication:
+            return {"ok": False, "error": str(error_indication)}
+        if error_status:
+            return {"ok": False, "error": error_status.prettyPrint()}
+        return {"ok": True, "message": f"SNMP Trap sent to UDP 127.0.0.1:{_trap_port}; event will be logged only after receiver parses it."}
+    except Exception as e:
+        logger.exception("Failed to send test SNMP Trap")
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/audit-logs")
@@ -436,6 +433,7 @@ def _scanned_device_record(device: Dict[str, Any], index: int) -> Dict[str, Any]
         "ip": ip,
         "ver": "v2c",
         "community": device.get("community", "public"),
+        "snmp_port": int(device.get("snmp_port", 161) or 161),
         "type": device_type,
         "vendor": device.get("vendor") or descr[:48] or "Network device",
         "descr": descr,
@@ -473,16 +471,21 @@ async def network_scan_endpoint(req: NetworkScanRequest):
                 result["descr"] = probe.get("descr") or result.get("descr", "")
                 result["up"] = probe.get("uptime", "0 วัน 00:00:00")
                 result["ports"] = await snmp_walk_interfaces(ip, community)
+            if not probe.get("ok") or not result.get("ports"):
+                continue
                 descr_lower = result["descr"].lower()
                 switch_markers = ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k", "cat3k", "cat4k")
                 result["type"] = "switch" if any(word in descr_lower for word in switch_markers) else result.get("type", "router")
             if ip in existing_by_ip:
-                devices.append(existing_by_ip[ip])
+                record = {**existing_by_ip[ip], **_scanned_device_record(result, index), "id": existing_by_ip[ip]["id"]}
+                save_device(record)
+                devices.append(record)
                 continue
             record = _scanned_device_record(result, index)
             save_device(record)
             devices.append(record)
-        return {"ok": True, "devices": devices, "count": len(devices), "new_count": sum(1 for d in devices if d["ip"] not in existing_by_ip)}
+        links = await discover_topology_links(get_all_devices())
+        return {"ok": True, "devices": devices, "count": len(devices), "new_count": sum(1 for d in devices if d["ip"] not in existing_by_ip), "links": links}
     except Exception as e:
         logger.error(f"Network scan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -501,35 +504,10 @@ async def eveng_scan_endpoint(req: EveNGScanRequest):
             req.password
         )
         
-        # EVE-NG console discovery does not expose interface state. Keep ports
-        # empty until SNMP data is available instead of displaying invented ports.
-        formatted_devices = []
-        for d in devices:
-            dev_type = d.get("type", "router")
-            ports = []
-            
-            dev_obj = {
-                "id": f"scan_{''.join(ch if ch.isalnum() else '_' for ch in d['ip'])}"[:80],
-                "name": d["name"],
-                "ip": d["ip"],
-                "ver": "v2c",
-                "community": "public",
-                "type": dev_type,
-                "vendor": d.get("vendor", "Cisco (EVE-NG)"),
-                "descr": d.get("descr", "EVE-NG Lab Node"),
-                "status": d.get("status", "online"),
-                "up": "0 วัน 00:00:00",
-                "ports": ports
-            }
-            
-            existing = next((item for item in get_all_devices() if item["ip"] == dev_obj["ip"]), None)
-            if existing:
-                dev_obj = existing
-            else:
-                save_device(dev_obj)
-            formatted_devices.append(dev_obj)
-
-        return {"ok": True, "devices": formatted_devices, "count": len(formatted_devices)}
+        # EVE console endpoints identify the terminal service, not the node's
+        # management IP. Return inventory only; SNMP monitor records are made
+        # from reachable management IPs via /api/devices or the subnet sweep.
+        return {"ok": True, "devices": devices, "count": len(devices), "inventory_only": True}
     except Exception as e:
         logger.error(f"EVE-NG scan error: {e}")
         return {"ok": False, "devices": [], "count": 0, "error": str(e)}

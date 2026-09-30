@@ -21,6 +21,7 @@ export const DevicesView: React.FC = () => {
     addDevice,
     addToast,
     addTopologyLink,
+    refreshDeviceData,
   } = useSnmp();
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -35,16 +36,6 @@ export const DevicesView: React.FC = () => {
   const [eveNGUser, setEveNGUser] = useState('admin');
   const [eveNGPass, setEveNGPass] = useState('eve');
   const [scanMode, setScanMode] = useState<'api' | 'telnet' | 'network'>('api');
-
-  // Auto scan on mount
-  React.useEffect(() => {
-    if (!autoScanned && 'serial' in navigator) {
-      const timer = setTimeout(() => {
-        handleAutoScan();
-      }, 2000); // Wait 2 seconds after page load
-      return () => clearTimeout(timer);
-    }
-  }, [autoScanned]);
 
   const handleAutoScanAll = async () => {
     setScanning(true);
@@ -145,21 +136,7 @@ export const DevicesView: React.FC = () => {
         if (!result.name) continue;
         
         if (!devices.some(d => d.name === result.name || d.ip === result.ip)) {
-          const dev: Device = {
-            id: `net${Date.now()}_${totalFound}`,
-            name: result.name,
-            ip: result.ip,
-            ver: 'v2c',
-            rw: result.community !== 'public',
-            type: (result.type || 'router') as 'router' | 'switch',
-            vendor: 'Cisco (SNMP)',
-            descr: result.descr || 'Network Device',
-            status: 'online',
-            up: '0d 0h',
-            ports: [],
-          };
-          
-          addDevice(dev);
+          addDevice(result as Device);
           totalFound++;
           console.log(`  ✅ Found: ${result.name} (${result.ip})`);
         }
@@ -421,14 +398,7 @@ export const DevicesView: React.FC = () => {
   };
 
   const handleRefresh = () => {
-    console.log('🔄 Refreshing devices page...');
-    setAutoScanned(false);
-    addToast('', 'กำลัง Refresh...', 'สแกนหาอุปกรณ์ใหม่');
-    
-    // Trigger auto-scan again
-    setTimeout(() => {
-      handleAutoScan();
-    }, 500);
+    refreshDeviceData();
   };
 
   const handleEveNGScan = async () => {
@@ -458,21 +428,7 @@ export const DevicesView: React.FC = () => {
             continue;
           }
           
-          const dev: Device = {
-            id: `net${Date.now()}_${addedCount}`,
-            name: result.name,
-            ip: result.ip,
-            ver: 'v2c',
-            rw: result.community !== 'public',
-            type: (result.type || 'router') as 'router' | 'switch',
-            vendor: 'Cisco (SNMP)',
-            descr: result.descr || 'Network Device',
-            status: 'online',
-            up: '0d 0h',
-            ports: [],
-          };
-          
-          addDevice(dev);
+          addDevice(result as Device);
           addedCount++;
         }
         
@@ -481,6 +437,7 @@ export const DevicesView: React.FC = () => {
         } else {
           addToast('', 'ไม่มีอุปกรณ์ใหม่', 'อุปกรณ์ที่เจอมีอยู่ในระบบแล้ว');
         }
+        refreshDeviceData();
         
       } catch (error: any) {
         console.error('Network scan error:', error);
@@ -508,40 +465,10 @@ export const DevicesView: React.FC = () => {
           return;
         }
         
-        let addedCount = 0;
-        
-        for (const result of results) {
-          if (!result.name) continue;
-          
-          const deviceIP = result.ip || `${eveNGHost}:${result.port || 32768}`;
-          if (devices.some(d => d.name === result.name || d.ip === deviceIP)) {
-            console.log(`Device ${result.name} (${deviceIP}) already exists, skipping`);
-            continue;
-          }
-          
-          const dev: Device = {
-            id: result.id || `eve_${Date.now()}_${addedCount}`,
-            name: result.name,
-            ip: deviceIP,
-            ver: 'v2c',
-            rw: false,
-            type: (result.type || 'router') as 'router' | 'switch',
-            vendor: result.vendor || 'Cisco (EVE-NG)',
-            descr: result.descr || 'EVE-NG Node',
-            status: result.status || 'online',
-            up: result.up || '1d 0h',
-            ports: result.ports || [],
-          };
-          
-          addDevice(dev);
-          addedCount++;
-        }
-        
-        if (addedCount > 0) {
-          addToast('ok', `ดึงสำเร็จ ${addedCount} อุปกรณ์!`, `จาก EVE-NG (${eveNGHost})`);
-        } else {
-          addToast('', 'ไม่มีอุปกรณ์ใหม่', 'อุปกรณ์ใน EVE-NG ทั้งหมดถูกดึงเข้ามาในระบบแล้ว');
-        }
+        const names = results.map((result: any) => result.name).filter(Boolean);
+        addToast('ok', `พบ ${names.length} Node ใน EVE-NG`, names.length
+          ? `${names.join(', ')} · ใช้ management IP ใน “เพิ่มด้วย IP” หรือสแกน management subnet เพื่ออ่านพอร์ตด้วย SNMP`
+          : 'ไม่พบ Node ที่กำลังทำงานใน Lab');
         
       } catch (error: any) {
         console.error('EVE-NG scan error:', error);
@@ -675,7 +602,7 @@ export const DevicesView: React.FC = () => {
                     <td className="mono">{d.up}</td>
                     <td className="mono">{getPortRatio(d)}</td>
                     <td className="mono">
-                      {d.ver} · {d.rw ? 'RW' : 'RO'}
+                      {d.ver} · SET ตรวจที่อุปกรณ์
                     </td>
                     <td className="r">
                       <button

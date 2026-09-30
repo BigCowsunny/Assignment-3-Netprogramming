@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { Device, DeviceType, SnmpVersion } from '../../types/snmp';
+import { testConnectionApi } from '../../services/api';
 
 interface EditDeviceModalProps {
   device: Device | null;
@@ -23,7 +24,8 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
   const [type, setType] = useState<DeviceType>('switch');
   const [vendor, setVendor] = useState('');
   const [version, setVersion] = useState<SnmpVersion>('v2c');
-  const [rw, setRw] = useState(true);
+  const [community, setCommunity] = useState('public');
+  const [snmpPort, setSnmpPort] = useState('161');
   const [status, setStatus] = useState<'online' | 'offline'>('online');
 
   const [isTesting, setIsTesting] = useState(false);
@@ -40,7 +42,8 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       setType(device.type);
       setVendor(device.vendor);
       setVersion(device.ver);
-      setRw(device.rw);
+      setCommunity(device.community || 'public');
+      setSnmpPort(String(device.snmp_port || device.port || 161));
       setStatus(device.status);
       setTestResult(null);
     }
@@ -48,7 +51,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
 
   if (!isOpen || !device) return null;
 
-  const handleTestConnection = () => {
+  const handleTestConnection = async () => {
     const trimmedIp = ip.trim();
     
     // Skip validation for Serial devices
@@ -73,14 +76,14 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
     setIsTesting(true);
     setTestResult(null);
 
-    setTimeout(() => {
+    try {
+      const result = await testConnectionApi({ ip: trimmedIp, snmp_version: version, community, port: Number(snmpPort), device_type: type, name });
+      setTestResult({ status: result.status === 'ok' ? 'ok' : 'err', message: result.message || 'เชื่อมต่อไม่สำเร็จ', details: result.details });
+    } catch (error) {
+      setTestResult({ status: 'err', message: 'ทดสอบไม่สำเร็จ', details: error instanceof Error ? error.message : String(error) });
+    } finally {
       setIsTesting(false);
-      setTestResult({
-        status: 'ok',
-        message: 'เชื่อมต่อสำเร็จ · sysDescr ตอบกลับ',
-        details: `sysName = ${name}\nsysDescr = ${device.descr}\nuptime = ${device.up}`,
-      });
-    }, 800);
+    }
   };
 
   const handleSave = () => {
@@ -102,7 +105,9 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       type,
       vendor: vendor.trim() || device.vendor,
       ver: version,
-      rw,
+      community,
+      snmp_port: Number(snmpPort),
+      port: Number(snmpPort),
       status,
     };
 
@@ -182,6 +187,17 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             </div>
           </div>
 
+          {ip !== 'Serial (COM)' && <div className="fgrid">
+            <div className="field">
+              <label htmlFor="ed-community">SNMP Community</label>
+              <input id="ed-community" type="password" value={community} onChange={(e) => setCommunity(e.target.value)} />
+            </div>
+            <div className="field">
+              <label htmlFor="ed-snmp-port">UDP Port</label>
+              <input id="ed-snmp-port" type="number" min="1" max="65535" value={snmpPort} onChange={(e) => setSnmpPort(e.target.value)} />
+            </div>
+          </div>}
+
           <div className="field">
             <label htmlFor="ed-vendor">รุ่น / Vendor</label>
             <input
@@ -202,26 +218,14 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
                 onChange={(e) => setVersion(e.target.value as SnmpVersion)}
               >
                 <option value="v2c">v2c</option>
-                <option value="v3">v3</option>
               </select>
             </div>
 
-            <div className="field">
-              <label htmlFor="ed-rw">สิทธิ์ SNMP</label>
-              <select
-                id="ed-rw"
-                value={rw ? 'rw' : 'ro'}
-                onChange={(e) => setRw(e.target.value === 'rw')}
-              >
-                <option value="rw">Read-Write (สั่ง Up/Down ได้)</option>
-                <option value="ro">Read-Only (ดูได้อย่างเดียว)</option>
-              </select>
-            </div>
           </div>
 
           {isTesting && (
             <div className="testbox on">
-              กำลังทดสอบ SNMP GET ที่ <span className="mono">{ip.trim()}:161</span> …
+              กำลังทดสอบ SNMP GET ที่ <span className="mono">{ip.trim()}:{snmpPort}</span> …
             </div>
           )}
 

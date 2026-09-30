@@ -46,8 +46,7 @@ export const DeviceDetailView: React.FC = () => {
               </span>
             </div>
             <p className="mono">
-              {activeDevice.ip} · {activeDevice.vendor} · SNMP {activeDevice.ver} (
-              {activeDevice.rw ? 'Read-Write' : 'Read-Only'}) · uptime {activeDevice.up}
+              {activeDevice.ip} · {activeDevice.vendor} · SNMP {activeDevice.ver} · ตรวจสิทธิ์ SET ที่อุปกรณ์ตอนสั่ง · uptime {activeDevice.up}
             </p>
           </div>
         </div>

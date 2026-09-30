@@ -244,5 +244,17 @@ async def start_trap_listener(port: int = 162) -> asyncio.DatagramTransport:
         logger.info("SNMP Trap Receiver started on UDP 0.0.0.0:1162 (redirect from 162 recommended)")
         return transport
     except Exception as e:
+        if port != 1162:
+            logger.warning(f"Could not bind UDP {port} ({e}). Trying fallback port 1162...")
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: SnmpTrapProtocol(),
+                    local_addr=("0.0.0.0", 1162)
+                )
+                logger.info("SNMP Trap Receiver started on UDP 0.0.0.0:1162")
+                return transport
+            except Exception as fallback_error:
+                logger.error(f"Could not bind SNMP Trap Receiver on 162 or 1162: {fallback_error}")
+                return None
         logger.error(f"Could not bind SNMP Trap Receiver: {e}")
         return None

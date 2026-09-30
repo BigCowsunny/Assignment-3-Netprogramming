@@ -1,10 +1,11 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { TrafficCanvas, TrafficCanvasRef } from '../common/TrafficCanvas';
-import { calculateStats, getSeriesFor, TIME_RANGES } from '../../utils/trafficGenerator';
+import { calculateStats, TIME_RANGES } from '../../utils/trafficGenerator';
 import { fmtRate, fmtSpeed } from '../../utils/formatters';
 import { TimeRange } from '../../types/snmp';
+import { fetchTrafficDataApi } from '../../services/api';
 
 export const TrafficView: React.FC = () => {
   const {
@@ -18,6 +19,31 @@ export const TrafficView: React.FC = () => {
   } = useSnmp();
 
   const chartRef = useRef<TrafficCanvasRef | null>(null);
+  const [points, setPoints] = useState<{ t: number; in: number | null; out: number | null }[]>([]);
+  const [trafficError, setTrafficError] = useState('');
+
+  useEffect(() => {
+    if (!activeDevice || !activePort) return;
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchTrafficDataApi(activeDevice.id, activePort.name, timeRange);
+        if (!active) return;
+        setPoints((rows as any[]).map((point) => ({ t: Number(point.t), in: point.in == null ? null : Number(point.in), out: point.out == null ? null : Number(point.out) })));
+        setTrafficError('');
+      } catch (error) {
+        if (!active) return;
+        setPoints([]);
+        setTrafficError(error instanceof Error ? error.message : String(error));
+      }
+    };
+    void load();
+    const refresh = window.setInterval(() => { void load(); }, timeRange === 'live' ? 10_000 : 60_000);
+    return () => { active = false; window.clearInterval(refresh); };
+  }, [activeDevice?.id, activePort?.name, timeRange]);
+
+  const statsIn = useMemo(() => calculateStats(points, 'in'), [points]);
+  const statsOut = useMemo(() => calculateStats(points, 'out'), [points]);
 
   if (!activeDevice || !activePort) {
     return (
@@ -32,13 +58,6 @@ export const TrafficView: React.FC = () => {
 
   const isUp = activePort.admin === 'up' && activePort.oper === 'up';
   const isAdminUp = activePort.admin === 'up';
-
-  const points = useMemo(() => {
-    return getSeriesFor(activeDevice, activePort, timeRange);
-  }, [activeDevice, activePort, timeRange]);
-
-  const statsIn = useMemo(() => calculateStats(points, 'in'), [points]);
-  const statsOut = useMemo(() => calculateStats(points, 'out'), [points]);
 
   const capacity = activePort.speed * 1e6;
   const currentUtil = statsIn ? Math.round((statsIn.cur / capacity) * 100) : 0;
@@ -165,6 +184,7 @@ export const TrafficView: React.FC = () => {
           </div>
         </div>
         <div className="card-body">
+          {trafficError && <p className="hint">โหลดข้อมูลทราฟฟิกไม่สำเร็จ: {trafficError}</p>}
           <TrafficCanvas
             ref={chartRef}
             points={points}

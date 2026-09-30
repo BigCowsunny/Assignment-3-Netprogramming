@@ -59,7 +59,10 @@ export async function createDeviceApi(payload: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error('Failed to add device');
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || body.error || 'Failed to add device');
+  }
   return res.json();
 }
 
@@ -70,6 +73,7 @@ export async function updateDeviceApi(
     ip: string;
     snmp_version: string;
     community: string;
+    port?: number;
     device_type: string;
     vendor?: string;
     status?: string;
@@ -80,7 +84,10 @@ export async function updateDeviceApi(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error('Failed to update device');
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || body.error || 'Failed to update device');
+  }
   return res.json();
 }
 
@@ -105,8 +112,9 @@ export async function setPortAdminApi(
       body: JSON.stringify({ status: turnDown ? 'down' : 'up' }),
     }
   );
-  if (!res.ok) throw new Error('Failed to set port admin status');
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error(data.detail || data.error || 'Failed to set port admin status');
+  return data;
 }
 
 export async function fetchEventsApi(device?: string, type?: string) {
@@ -132,6 +140,12 @@ export async function fetchAuditLogsApi() {
   return res.json();
 }
 
+export async function fetchTopologyApi() {
+  const res = await fetch(`${API_BASE_URL}/topology`);
+  if (!res.ok) throw new Error('Failed to fetch topology');
+  return res.json();
+}
+
 export async function fetchTrafficDataApi(
   deviceId: string,
   portName: string,
@@ -141,6 +155,18 @@ export async function fetchTrafficDataApi(
     `${API_BASE_URL}/interfaces/${encodeURIComponent(deviceId)}/${encodeURIComponent(portName)}/traffic?range=${range}`
   );
   if (!res.ok) throw new Error('Failed to fetch traffic samples');
+  return res.json();
+}
+
+export async function fetchAggregateTrafficApi(range: string = 'day') {
+  const res = await fetch(`${API_BASE_URL}/traffic/aggregate?range=${encodeURIComponent(range)}`);
+  if (!res.ok) throw new Error('Failed to fetch aggregate traffic samples');
+  return res.json();
+}
+
+export async function fetchLatestTrafficApi() {
+  const res = await fetch(`${API_BASE_URL}/traffic/latest`);
+  if (!res.ok) throw new Error('Failed to fetch latest traffic samples');
   return res.json();
 }
 

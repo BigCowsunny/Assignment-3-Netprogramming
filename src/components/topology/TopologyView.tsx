@@ -27,6 +27,8 @@ export const TopologyView: React.FC = () => {
   const [network, setNetwork] = useState('192.168.1.0/24');
   const [communities, setCommunities] = useState('public,private');
   const [evengHost, setEvengHost] = useState('192.168.213.1');
+  const [evengUsername, setEvengUsername] = useState('admin');
+  const [evengPassword, setEvengPassword] = useState('eve');
 
   const [dragState, setDragState] = useState<{
     nodeId: string;
@@ -39,7 +41,9 @@ export const TopologyView: React.FC = () => {
     setIsDiscovering(true);
     setDiscoverProgress(0);
     setDiscoverProgress(35);
-    await runDiscovery(scanMode === 'eveng' ? { mode: 'eveng', host: evengHost } : { mode: 'network', network, communities });
+    await runDiscovery(scanMode === 'eveng'
+      ? { mode: 'eveng', host: evengHost, username: evengUsername, password: evengPassword }
+      : { mode: 'network', network, communities });
     setDiscoverProgress(100);
     setIsDiscovering(false);
     setTimeout(() => setDiscoverProgress(0), 500);
@@ -133,7 +137,11 @@ export const TopologyView: React.FC = () => {
                 <input aria-label="SNMP communities" value={communities} onChange={(e) => setCommunities(e.target.value)} placeholder="SNMP communities คั่นด้วย comma" disabled={isDiscovering} />
               </>
             ) : (
-              <input aria-label="EVE-NG host" value={evengHost} onChange={(e) => setEvengHost(e.target.value)} placeholder="EVE-NG IP หรือ URL" disabled={isDiscovering} />
+              <>
+                <input aria-label="EVE-NG host" value={evengHost} onChange={(e) => setEvengHost(e.target.value)} placeholder="EVE-NG IP หรือ URL" disabled={isDiscovering} />
+                <input aria-label="EVE-NG username" value={evengUsername} onChange={(e) => setEvengUsername(e.target.value)} placeholder="Username" disabled={isDiscovering} />
+                <input aria-label="EVE-NG password" type="password" value={evengPassword} onChange={(e) => setEvengPassword(e.target.value)} placeholder="Password" disabled={isDiscovering} />
+              </>
             )}
             <button
               className="btn btn-primary"

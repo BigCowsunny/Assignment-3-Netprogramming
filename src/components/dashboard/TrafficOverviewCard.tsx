@@ -1,15 +1,26 @@
-import React, { useMemo } from 'react';
-import { useSnmp } from '../../context/SnmpContext';
+import React, { useEffect, useMemo, useState } from 'react';
 import { TrafficCanvas } from '../common/TrafficCanvas';
-import { calculateStats, getAggregateTraffic } from '../../utils/trafficGenerator';
+import { calculateStats } from '../../utils/trafficGenerator';
 import { fmtRate } from '../../utils/formatters';
+import { TrafficPoint } from '../../types/snmp';
+import { fetchAggregateTrafficApi } from '../../services/api';
 
 export const TrafficOverviewCard: React.FC = () => {
-  const { devices } = useSnmp();
-
-  const aggregatePoints = useMemo(() => {
-    return getAggregateTraffic(devices);
-  }, [devices]);
+  const [aggregatePoints, setAggregatePoints] = useState<TrafficPoint[]>([]);
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const rows = await fetchAggregateTrafficApi('day');
+        if (active) setAggregatePoints((rows as any[]).map((point) => ({ t: Number(point.t), in: point.in == null ? null : Number(point.in), out: point.out == null ? null : Number(point.out) })));
+      } catch {
+        if (active) setAggregatePoints([]);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 60_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
 
   const maxIn = useMemo(() => {
     return calculateStats(aggregatePoints, 'in');

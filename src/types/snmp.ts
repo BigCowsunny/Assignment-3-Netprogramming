@@ -28,6 +28,9 @@ export interface Device {
   vendor: string;
   descr: string;
   ver: SnmpVersion;
+  community?: string;
+  port?: number;
+  snmp_port?: number;
   rw: boolean;
   status: DeviceStatus;
   up: string;

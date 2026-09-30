@@ -100,7 +100,7 @@ export const ChassisPanel: React.FC<ChassisPanelProps> = ({ device }) => {
         <div className="chassis">
           <div className="chassis-top">
             <span>
-              {device.vendor} · {isSwitch ? '24×1G + 2×10G' : '4 interfaces'}
+              {device.vendor} · {shownPorts.length} interfaces จาก SNMP
             </span>
             <span className="leds">
               <span>

@@ -1,9 +1,10 @@
 import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
-import { getSeriesFor } from '../../utils/trafficGenerator';
+import { useLatestTraffic } from '../../hooks/useLatestTraffic';
 
 export const KpiGrid: React.FC = () => {
   const { devices, events } = useSnmp();
+  const latestTraffic = useLatestTraffic();
 
   const onlineCount = devices.filter((d) => d.status === 'online').length;
   let totalPorts = 0;
@@ -30,13 +31,10 @@ export const KpiGrid: React.FC = () => {
       .filter((p) => !p.virtual && p.admin === 'up' && p.oper === 'up')
       .slice(0, 3)
       .forEach((p) => {
-        const pts = getSeriesFor(d, p, 'live');
-        for (let i = pts.length - 1; i >= 0; i--) {
-          if (pts[i].in != null) {
-            sumUtil += (pts[i].in! / (p.speed * 1e6)) * 100;
-            sampleCount++;
-            break;
-          }
+        const sample = latestTraffic.find((row) => row.device_id === d.id && row.port_name === p.name);
+        if (sample && p.speed > 0) {
+          sumUtil += (sample.in_bps / (p.speed * 1e6)) * 100;
+          sampleCount++;
         }
       });
   });
@@ -75,8 +73,8 @@ export const KpiGrid: React.FC = () => {
 
       <div className="card kpi">
         <div className="lbl">โหลดเฉลี่ย</div>
-        <div className="v">{avgLoad}%</div>
-        <div className="s">เฉลี่ยจากพอร์ตที่เปิดใช้งาน</div>
+        <div className="v">{sampleCount ? `${avgLoad}%` : '—'}</div>
+        <div className="s">{sampleCount ? 'จาก sample SNMP ล่าสุด' : 'รอ sample SNMP จาก poller'}</div>
       </div>
     </div>
   );

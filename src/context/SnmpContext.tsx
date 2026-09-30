@@ -11,7 +11,6 @@ import {
   TrapEvent,
   ViewName,
 } from '../types/snmp';
-import { fmtHM } from '../utils/formatters';
 import { scanEveNGLab, scanNetwork } from '../services/eveng';
 import {
   checkBackendHealth,
@@ -24,6 +23,7 @@ import {
   fetchAuditLogsApi,
   triggerBackendTestTrapApi,
   connectTrapWebSocket,
+  fetchTopologyApi,
 } from '../services/api';
 
 interface SnmpContextType {
@@ -85,7 +85,9 @@ const SnmpContext = createContext<SnmpContextType | null>(null);
 
 export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [isBackendConnected, setIsBackendConnected] = useState<boolean>(false);
+  const [isBootstrapped, setIsBootstrapped] = useState<boolean>(false);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [topologyLinks, setTopologyLinks] = useState<TopologyLink[]>([]);
 
   const [events, setEvents] = useState<TrapEvent[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
@@ -118,8 +120,51 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   });
 
-  // Clean up topology positions for deleted devices on mount
   useEffect(() => {
+    let active = true;
+    const loadBackendState = async () => {
+      const healthy = await checkBackendHealth();
+      if (!active) return;
+      setIsBackendConnected(healthy);
+      if (!healthy) {
+        setIsBootstrapped(true);
+        return;
+      }
+
+      const [deviceResult, eventResult, auditResult, topologyResult] = await Promise.allSettled([
+        fetchDevicesApi(), fetchEventsApi(), fetchAuditLogsApi(), fetchTopologyApi(),
+      ]);
+      if (!active) return;
+      if (deviceResult.status === 'fulfilled') {
+        const loadedDevices = deviceResult.value as Device[];
+        setDevices(loadedDevices);
+        setSelectedDeviceId((current) => loadedDevices.some((device) => device.id === current) ? current : (loadedDevices[0]?.id || ''));
+      }
+      if (eventResult.status === 'fulfilled') setEvents((eventResult.value as any[]).map((event) => ({ ...event, t: new Date(event.t) })));
+      if (auditResult.status === 'fulfilled') setAuditLogs((auditResult.value as any[]).map((item) => ({
+        id: item.id, t: new Date(item.timestamp), user: item.user, action: item.action, target: item.target, result: item.result,
+      })));
+      if (topologyResult.status === 'fulfilled') {
+        const topology = topologyResult.value as { devices: Device[]; links: TopologyLink[] };
+        setTopologyLinks(topology.links || []);
+        setTopologyPos((saved) => {
+          const next = { ...saved };
+          (topology.devices || []).forEach((device, index) => {
+            if (!next[device.id]) next[device.id] = { x: 150 + (index % 4) * 190, y: 100 + (Math.floor(index / 4) % 3) * 130 };
+          });
+          try { localStorage.setItem('od-topo', JSON.stringify(next)); } catch {}
+          return next;
+        });
+      }
+      setIsBootstrapped(true);
+    };
+    void loadBackendState();
+    return () => { active = false; };
+  }, []);
+
+  // Clean up topology positions for deleted devices after backend state has been loaded.
+  useEffect(() => {
+    if (!isBootstrapped || !isBackendConnected) return;
     setTopologyPos((prev) => {
       const deviceIds = devices.map(d => d.id);
       const cleaned: Record<string, TopologyNodePos> = {};
@@ -144,15 +189,14 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       
       return prev;
     });
-  }, [devices]);
+  }, [devices, isBootstrapped, isBackendConnected]);
 
-  const [topologyLinks, setTopologyLinks] = useState<TopologyLink[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [filterType, setFilterType] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogOptions | null>(null);
-  const [pollingCountdown, setPollingCountdown] = useState<number>(15);
+  const [pollingCountdown, setPollingCountdown] = useState<number>(60);
 
   const activeDevice = devices.find((d) => d.id === selectedDeviceId);
   const activePort = activeDevice?.ports.find((p) => p.name === selectedPortName);
@@ -243,10 +287,24 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setView('devices');
   };
 
-  const updateDevice = (updatedDevice: Device) => {
-    setDevices((prev) => prev.map((d) => (d.id === updatedDevice.id ? updatedDevice : d)));
-    addAuditLog(`แก้ไขอุปกรณ์ ${updatedDevice.name}`, updatedDevice.ip, 'สำเร็จ');
-    addToast('ok', 'แก้ไขอุปกรณ์แล้ว', `${updatedDevice.name} (${updatedDevice.ip})`);
+  const updateDevice = async (updatedDevice: Device) => {
+    try {
+      const saved = updatedDevice.ip === 'Serial (COM)' ? updatedDevice : await updateDeviceApi(updatedDevice.id, {
+        name: updatedDevice.name,
+        ip: updatedDevice.ip,
+        snmp_version: updatedDevice.ver,
+        community: updatedDevice.community || 'public',
+        port: updatedDevice.snmp_port || updatedDevice.port || 161,
+        device_type: updatedDevice.type,
+        vendor: updatedDevice.vendor,
+        status: updatedDevice.status,
+      });
+      setDevices((prev) => prev.map((d) => (d.id === updatedDevice.id ? saved as Device : d)));
+      addAuditLog(`แก้ไขอุปกรณ์ ${updatedDevice.name}`, updatedDevice.ip, 'สำเร็จ');
+      addToast('ok', 'แก้ไขอุปกรณ์แล้ว', `${updatedDevice.name} (${updatedDevice.ip})`);
+    } catch (error) {
+      addToast('bad', 'แก้ไขอุปกรณ์ไม่สำเร็จ', error instanceof Error ? error.message : String(error));
+    }
   };
 
   const deleteDevice = (deviceId: string) => {
@@ -258,8 +316,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       body: `ลบ <b>${target.name}</b> <span class="mono">${target.ip}</span> ออกจากตาราง monitor?<br><span class="hint">ข้อมูลทราฟฟิกย้อนหลังของอุปกรณ์นี้จะถูกลบด้วย</span>`,
       okText: 'ลบอุปกรณ์',
       danger: true,
-      onConfirm: () => {
+      onConfirm: async () => {
+        try {
+          if (target.ip !== 'Serial (COM)') await deleteDeviceApi(deviceId);
         setDevices((prev) => prev.filter((d) => d.id !== deviceId));
+        setTopologyLinks((prev) => prev.filter((link) => link.a !== deviceId && link.b !== deviceId));
         
         // Remove from topology positions
         setTopologyPos((prev) => {
@@ -278,6 +339,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         addAuditLog(`ลบอุปกรณ์ ${target.name}`, target.ip, 'สำเร็จ');
         addToast('ok', 'ลบอุปกรณ์แล้ว', target.name);
         closeConfirm();
+        } catch (error) {
+          addToast('bad', 'ลบอุปกรณ์ไม่สำเร็จ', error instanceof Error ? error.message : String(error));
+          closeConfirm();
+        }
       },
     });
   };
@@ -287,21 +352,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if (!dev) return;
     const port = dev.ports.find((p) => p.name === portName);
     if (!port) return;
-
-    // Check if this is a Serial device
-    const isSerial = dev.ip === 'Serial (COM)';
-
-    if (!isSerial && !dev.rw) {
-      addToast(
-        'bad',
-        'SNMP SET ล้มเหลว',
-        `community เป็น read-only · noSuchName · ifAdminStatus.${port.idx}`
-      );
-      addAuditLog(`สั่ง ${turnDown ? 'Shutdown' : 'No Shutdown'} ${port.name}`, dev.name, 'ล้มเหลว (RO)');
-      return;
-    }
-
-    if (isSerial) {
+    if (dev.ip === 'Serial (COM)') {
       addToast(
         'bad',
         'ไม่รองรับ',
@@ -326,10 +377,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         addToast(
           '',
           'กำลังส่ง SNMP SET',
-          `ifAdminStatus.${port.idx} = ${turnDown ? 2 : 1} → ${dev.ip}:161`
+          `ifAdminStatus.${port.idx} = ${turnDown ? 2 : 1} → ${dev.ip}:${dev.snmp_port || dev.port || 161}`
         );
 
-        setTimeout(() => {
+        void setPortAdminApi(deviceId, portName, turnDown).then((result) => {
           setDevices((prev) =>
             prev.map((d) => {
               if (d.id !== deviceId) return d;
@@ -339,85 +390,32 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                   if (p.name !== portName) return p;
                   return {
                     ...p,
-                    admin: turnDown ? 'down' : 'up',
-                    oper: turnDown ? 'down' : 'up',
+                    admin: result.admin,
+                    oper: result.oper,
                   };
                 }),
               };
             })
           );
-
-          const trapType = turnDown ? 'linkDown' : 'linkUp';
-          const newEvent: TrapEvent = {
-            id: 'e_' + Math.random().toString(36).slice(2, 8),
-            t: new Date(),
-            dev: dev.id,
-            src: dev.ip,
-            port: port.name,
-            type: trapType,
-            oid: trapType === 'linkDown' ? '1.3.6.1.6.3.1.1.5.3' : '1.3.6.1.6.3.1.1.5.4',
-            isNew: true,
-          };
-          setEvents((prev) => [newEvent, ...prev.slice(0, 79)]);
-
           addAuditLog(`สั่ง ${turnDown ? 'Shutdown' : 'No Shutdown'} ${port.name}`, dev.name, 'สำเร็จ');
           addToast(
             'ok',
-            'SNMP SET สำเร็จ · อ่านค่ากลับแล้ว',
-            `${dev.name} · ${port.name} → ${turnDown ? 'down' : 'up'}`
+            'SNMP SET สำเร็จ · อ่านค่าจากอุปกรณ์แล้ว',
+            `${dev.name} · ${port.name} · admin ${result.admin}, oper ${result.oper}`
           );
-        }, 750);
+        }).catch((error) => {
+          addAuditLog(`สั่ง ${turnDown ? 'Shutdown' : 'No Shutdown'} ${port.name}`, dev.name, 'ล้มเหลว');
+          addToast('bad', 'SNMP SET ล้มเหลว', error instanceof Error ? error.message : String(error));
+        });
       },
     });
   };
 
-  let testSeq = 0;
   const triggerTestTrap = () => {
-    const onlines = devices.filter((d) => d.status === 'online');
-    if (!onlines.length) {
-      addToast('bad', 'ส่ง Test Trap ไม่ได้', 'ไม่มีอุปกรณ์ออนไลน์');
-      return;
-    }
-
-    const d = onlines[testSeq % onlines.length];
-    const candidatePorts = d.ports.filter((p) => !p.virtual && p.admin === 'up');
-    const p = candidatePorts.length ? candidatePorts[testSeq % candidatePorts.length] : null;
-    testSeq++;
-
-    const trapType = testSeq % 2 ? 'linkDown' : 'linkUp';
-
-    if (p) {
-      setDevices((prev) =>
-        prev.map((item) => {
-          if (item.id !== d.id) return item;
-          return {
-            ...item,
-            ports: item.ports.map((portItem) => {
-              if (portItem.name !== p.name) return portItem;
-              return { ...portItem, oper: trapType === 'linkDown' ? 'down' : 'up' };
-            }),
-          };
-        })
-      );
-    }
-
-    const newEvent: TrapEvent = {
-      id: 'e_' + Math.random().toString(36).slice(2, 8),
-      t: new Date(),
-      dev: d.id,
-      src: d.ip,
-      port: p ? p.name : 'ifIndex 1',
-      type: trapType,
-      oid: trapType === 'linkDown' ? '1.3.6.1.6.3.1.1.5.3' : '1.3.6.1.6.3.1.1.5.4',
-      isNew: true,
-    };
-
-    setEvents((prev) => [newEvent, ...prev.slice(0, 79)]);
-    addToast(
-      trapType === 'linkDown' ? 'bad' : 'ok',
-      `Test Trap: ${trapType}`,
-      `${d.ip}:162 → ${d.name} · OID ${newEvent.oid}`
-    );
+    void triggerBackendTestTrapApi().then((result) => {
+      if (!result.ok) throw new Error(result.error || 'ส่ง SNMP Trap ไม่สำเร็จ');
+      addToast('', 'ส่ง SNMP Test Trap แล้ว', 'รอรับ packet จาก Trap Receiver ผ่าน UDP');
+    }).catch((error) => addToast('bad', 'ส่ง Test Trap ไม่สำเร็จ', error instanceof Error ? error.message : String(error)));
   };
 
   const runDiscovery = async (options: { mode: 'network' | 'eveng'; network?: string; host?: string; communities?: string; username?: string; password?: string } = { mode: 'network' }): Promise<void> => {
@@ -425,6 +423,16 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       const found = options.mode === 'eveng'
         ? await scanEveNGLab(options.host?.trim() || '', 32768, 32775, options.username || 'admin', options.password || 'eve', true)
         : await scanNetwork(options.network?.trim() || '192.168.1.0/24', (options.communities || 'public').split(',').map((value) => value.trim()).filter(Boolean));
+
+      if (options.mode === 'eveng') {
+        const names = found.map((node: any) => node.name).filter(Boolean);
+        setDiscoveryFound(true);
+        addAuditLog('EVE-NG Lab Inventory', options.host || '', 'สำเร็จ');
+        addToast('ok', `พบ ${names.length} Node ใน EVE-NG`, names.length
+          ? `${names.join(', ')} · ใส่ management IP ของ node ใน “เพิ่มด้วย IP” หรือสแกน management subnet เพื่อดึงพอร์ตผ่าน SNMP`
+          : 'ไม่พบ Node ที่กำลังทำงานใน Lab');
+        return;
+      }
 
       const normalized = found as Device[];
       const knownIps = new Set(devices.map((device) => device.ip));
@@ -445,6 +453,8 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         return next;
       });
       setDiscoveryFound(true);
+      const topology = await fetchTopologyApi().catch(() => null);
+      if (topology) setTopologyLinks(topology.links || []);
       addAuditLog(`Auto Discovery (${options.mode === 'eveng' ? 'EVE-NG' : 'SNMP'})`, options.mode === 'eveng' ? options.host || '' : options.network || '', 'สำเร็จ');
       addToast('ok', 'Discovery เสร็จสิ้น', `พบ ${normalized.length} อุปกรณ์ · เพิ่มใหม่ ${added.length} อุปกรณ์`);
     } catch (error) {
@@ -482,27 +492,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const refreshDeviceData = () => {
-    setPollingCountdown(15);
-    // random jitter errors
-    if (selectedDeviceId) {
-      setDevices((prev) =>
-        prev.map((d) => {
-          if (d.id !== selectedDeviceId) return d;
-          const upPorts = d.ports.filter((p) => !p.virtual && p.oper === 'up');
-          if (!upPorts.length) return d;
-          const chosen = upPorts[Math.floor(Math.random() * upPorts.length)];
-          return {
-            ...d,
-            ports: d.ports.map((p) =>
-              p.name === chosen.name
-                ? { ...p, errors: p.errors > 0 ? 0 : 6 + Math.floor(Math.random() * 20) }
-                : p
-            ),
-          };
-        })
-      );
-    }
-    addToast('', 'รีเฟรชแล้ว', 'SNMP GET sysUpTime + ifTable ล่าสุด');
+    setPollingCountdown(60);
+    void fetchDevicesApi().then((freshDevices: Device[]) => {
+      setDevices(freshDevices);
+      addToast('', 'รีเฟรชแล้ว', 'อ่านสถานะและ interface ล่าสุดจาก Backend/SNMP');
+    }).catch((error) => addToast('bad', 'รีเฟรชไม่สำเร็จ', error instanceof Error ? error.message : String(error)));
   };
 
   // Poller countdown ticker
@@ -510,7 +504,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     const timer = setInterval(() => {
       setPollingCountdown((prev) => {
         if (prev <= 1) {
-          return 15;
+          return 60;
         }
         return prev - 1;
       });
@@ -518,57 +512,31 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     return () => clearInterval(timer);
   }, []);
 
-  // Real-time random SNMP Trap simulation
+  // Receive only actual backend trap/status events over the WebSocket.
   useEffect(() => {
-    if (!isRealtime) return;
-
-    const interval = setInterval(() => {
-      if (Math.random() < 0.65) return; // 35% chance to toggle
-      const switchDevices = devices.filter((d) => d.status === 'online' && d.type === 'switch');
-      if (!switchDevices.length) return;
-
-      const randomDev = switchDevices[Math.floor(Math.random() * switchDevices.length)];
-      const activePorts = randomDev.ports.filter((p) => !p.virtual && p.admin === 'up');
-      if (!activePorts.length) return;
-
-      const randomPort = activePorts[Math.floor(Math.random() * activePorts.length)];
-      const nextOper = randomPort.oper === 'up' ? 'down' : 'up';
-      const trapType: TrapEvent['type'] = nextOper === 'up' ? 'linkUp' : 'linkDown';
-
-      setDevices((prev) =>
-        prev.map((d) => {
-          if (d.id !== randomDev.id) return d;
-          return {
-            ...d,
-            ports: d.ports.map((p) => {
-              if (p.name !== randomPort.name) return p;
-              return { ...p, oper: nextOper };
-            }),
-          };
-        })
-      );
-
-      const newTrap: TrapEvent = {
-        id: 'e_' + Math.random().toString(36).slice(2, 8),
-        t: new Date(),
-        dev: randomDev.id,
-        src: randomDev.ip,
-        port: randomPort.name,
-        type: trapType,
-        oid: trapType === 'linkDown' ? '1.3.6.1.6.3.1.1.5.3' : '1.3.6.1.6.3.1.1.5.4',
-        isNew: true,
-      };
-
-      setEvents((prev) => [newTrap, ...prev.slice(0, 79)]);
-      addToast(
-        trapType === 'linkDown' ? 'bad' : 'ok',
-        trapType === 'linkDown' ? 'Link Down (TRAP)' : 'Link Up (TRAP)',
-        `${randomDev.name} · ${randomPort.name} · ${fmtHM(new Date())}`
-      );
-    }, 6500);
-
-    return () => clearInterval(interval);
-  }, [isRealtime, devices]);
+    if (!isRealtime || !isBackendConnected) return;
+    const socket = connectTrapWebSocket((message) => {
+      if (message.type === 'TRAP_EVENT' && message.event) {
+        const event = { ...message.event, t: new Date(message.event.t) } as TrapEvent;
+        setEvents((prev) => [event, ...prev.filter((item) => item.id !== event.id)].slice(0, 80));
+        if (event.dev !== 'unknown') {
+          setDevices((prev) => prev.map((device) => device.id !== event.dev ? device : {
+            ...device,
+            ports: device.ports.map((port) => port.name === event.port ? { ...port, oper: event.type === 'linkDown' ? 'down' : 'up' } : port),
+          }));
+        }
+        addToast(event.type === 'linkDown' ? 'bad' : 'ok', event.type === 'linkDown' ? 'Link Down (SNMP Trap)' : 'Link Up (SNMP Trap)', `${event.src} · ${event.port}`);
+      } else if (message.type === 'PORT_STATUS_CHANGE') {
+        setDevices((prev) => prev.map((device) => device.id !== message.device_id ? device : {
+          ...device,
+          ports: device.ports.map((port) => port.name === message.port_name ? { ...port, admin: message.admin, oper: message.oper } : port),
+        }));
+      } else if (message.type === 'DEVICE_STATUS_CHANGE') {
+        setDevices((prev) => prev.map((device) => device.id === message.device_id ? { ...device, status: message.status, up: message.uptime || device.up } : device));
+      }
+    });
+    return () => socket?.close();
+  }, [isRealtime, isBackendConnected]);
 
   const connectBackend = async (): Promise<boolean> => {
     const isOk = await checkBackendHealth();
