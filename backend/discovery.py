@@ -19,7 +19,6 @@ from pysnmp.hlapi.v3arch.asyncio import (
 from database import (
     get_all_devices,
     save_device,
-    get_db,
     add_audit_log,
 )
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
@@ -117,47 +116,6 @@ async def discover_network(seed_ip: str, community: str = "public", subnet: str 
             }
             save_device(new_dev)
             discovered_new_devices.append(new_dev)
-
-    # In lab environment or demonstration, if no physical hardware answers,
-    # simulate the FR-6.7 Discovery of neighbor Access-SW-05
-    has_d7 = any(d["id"] == "d7" for d in existing_devices)
-    if not discovered_new_devices and not has_d7:
-        d7_ports = []
-        for i in range(1, 25):
-            d7_ports.append({
-                "idx": i, "name": f"Fa0/{i}", "speed": 100,
-                "admin": "up", "oper": "up" if i in (1, 3, 5, 7, 9) else "down",
-                "errors": 0, "mac": f"00:1e:bd:77:10:{i:02x}", "alias": f"Port {i}",
-                "virtual": False, "ip": ""
-            })
-        d7_ports.append({"idx": 25, "name": "Gi0/1", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:1e:bd:77:fe:01", "alias": "Uplink to Access-SW-02", "virtual": False, "ip": ""})
-        d7_ports.append({"idx": 26, "name": "Gi0/2", "speed": 1000, "admin": "up", "oper": "down", "errors": 0, "mac": "00:1e:bd:77:fe:02", "alias": "Spare", "virtual": False, "ip": ""})
-
-        new_switch = {
-            "id": "d7",
-            "name": "Access-SW-05",
-            "ip": "192.168.10.15",
-            "ver": "v2c",
-            "community": "private",
-            "type": "switch",
-            "vendor": "Cisco C1000-24T",
-            "descr": "Cisco IOS Software, C1000 Software (C1000-LANBASEK9-M), Version 15.2(7)E7",
-            "status": "online",
-            "up": "12 วัน 06:30:11",
-            "ports": d7_ports
-        }
-        save_device(new_switch)
-        discovered_new_devices.append(new_switch)
-
-        # Save link in DB
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO topology_links (id, device_a, port_a, device_b, port_b, protocol) VALUES (?, ?, ?, ?, ?, ?)",
-                       ("l_discovered_d7", "d4", "Fa0/2", "d7", "Fa0/1", "LLDP"))
-        conn.commit()
-        conn.close()
-
-        discovered_new_links.append({"a": "d4", "pa": "Fa0/2", "b": "d7", "pb": "Fa0/1"})
 
     add_audit_log("admin", "Auto Discovery (LLDP/CDP)", subnet or seed_ip or "Network", f"พบ {len(discovered_new_devices)} อุปกรณ์ใหม่")
 

@@ -419,6 +419,32 @@ class NetworkScanRequest(BaseModel):
     max_concurrent: int = 50
 
 
+def _scanned_device_record(device: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """Normalize scanner results to the database's device shape."""
+    ip = str(device.get("ip", "")).strip()
+    name = str(device.get("name") or f"Device-{ip}")
+    descr = str(device.get("descr") or "")
+    device_type = str(device.get("type") or "router").lower()
+    if device_type not in ("router", "switch"):
+        device_type = "router"
+    # Stable IDs prevent every scan from creating a duplicate device.
+    safe_ip = "".join(ch if ch.isalnum() else "_" for ch in ip)
+    device_id = f"scan_{safe_ip}"[:80] or f"scan_{index}"
+    return {
+        "id": device_id,
+        "name": name,
+        "ip": ip,
+        "ver": "v2c",
+        "community": device.get("community", "public"),
+        "type": device_type,
+        "vendor": device.get("vendor") or descr[:48] or "Network device",
+        "descr": descr,
+        "status": device.get("status", "online"),
+        "up": device.get("up", "0 วัน 00:00:00"),
+        "ports": device.get("ports", []),
+    }
+
+
 class EveNGScanRequest(BaseModel):
     host: str = "192.168.213.1"
     start_port: int = 32768
@@ -433,8 +459,30 @@ async def network_scan_endpoint(req: NetworkScanRequest):
     """Network scan to discover devices via SNMP/Telnet"""
     logger.info(f"Network scan request: {req.network}")
     try:
-        devices = await scan_network(req.network, req.communities, req.max_concurrent)
-        return {"ok": True, "devices": devices, "count": len(devices)}
+        scanned = await scan_network(req.network, req.communities, req.max_concurrent)
+        existing_by_ip = {d["ip"]: d for d in get_all_devices()}
+        devices = []
+        for index, result in enumerate(scanned, start=1):
+            ip = result.get("ip", "")
+            if not ip:
+                continue
+            community = result.get("community", req.communities[0] if req.communities else "public")
+            probe = await snmp_get_system_info(ip, community)
+            if probe.get("ok"):
+                result["name"] = probe.get("name") or result.get("name")
+                result["descr"] = probe.get("descr") or result.get("descr", "")
+                result["up"] = probe.get("uptime", "0 วัน 00:00:00")
+                result["ports"] = await snmp_walk_interfaces(ip, community)
+                descr_lower = result["descr"].lower()
+                switch_markers = ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k", "cat3k", "cat4k")
+                result["type"] = "switch" if any(word in descr_lower for word in switch_markers) else result.get("type", "router")
+            if ip in existing_by_ip:
+                devices.append(existing_by_ip[ip])
+                continue
+            record = _scanned_device_record(result, index)
+            save_device(record)
+            devices.append(record)
+        return {"ok": True, "devices": devices, "count": len(devices), "new_count": sum(1 for d in devices if d["ip"] not in existing_by_ip)}
     except Exception as e:
         logger.error(f"Network scan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -453,25 +501,15 @@ async def eveng_scan_endpoint(req: EveNGScanRequest):
             req.password
         )
         
-        # Populate interface templates if missing
+        # EVE-NG console discovery does not expose interface state. Keep ports
+        # empty until SNMP data is available instead of displaying invented ports.
         formatted_devices = []
         for d in devices:
             dev_type = d.get("type", "router")
-            if dev_type == "switch":
-                ports = [
-                    {"idx": i, "name": f"Fa0/{i}", "speed": 100, "admin": "up", "oper": "up" if i in (1, 2, 3) else "down", "errors": 0, "mac": f"00:50:56:e0:01:{i:02x}", "alias": f"FastEthernet0/{i}", "virtual": False, "ip": ""}
-                    for i in range(1, 25)
-                ]
-                ports.append({"idx": 25, "name": "Gi0/1", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:50:56:e0:01:fe", "alias": "Uplink", "virtual": False, "ip": ""})
-            else:
-                ports = [
-                    {"idx": 1, "name": "Gi0/0", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:50:56:e0:02:01", "alias": "GigabitEthernet0/0 (EVE)", "virtual": False, "ip": ""},
-                    {"idx": 2, "name": "Gi0/1", "speed": 1000, "admin": "up", "oper": "up", "errors": 0, "mac": "00:50:56:e0:02:02", "alias": "GigabitEthernet0/1", "virtual": False, "ip": ""},
-                    {"idx": 3, "name": "Gi0/2", "speed": 1000, "admin": "up", "oper": "down", "errors": 0, "mac": "00:50:56:e0:02:03", "alias": "GigabitEthernet0/2", "virtual": False, "ip": ""},
-                ]
+            ports = []
             
             dev_obj = {
-                "id": f"eve_{d['name']}_{d['port']}",
+                "id": f"scan_{''.join(ch if ch.isalnum() else '_' for ch in d['ip'])}"[:80],
                 "name": d["name"],
                 "ip": d["ip"],
                 "ver": "v2c",
@@ -480,18 +518,21 @@ async def eveng_scan_endpoint(req: EveNGScanRequest):
                 "vendor": d.get("vendor", "Cisco (EVE-NG)"),
                 "descr": d.get("descr", "EVE-NG Lab Node"),
                 "status": d.get("status", "online"),
-                "up": "1 วัน 04:12:00",
+                "up": "0 วัน 00:00:00",
                 "ports": ports
             }
             
-            if req.auto_save:
+            existing = next((item for item in get_all_devices() if item["ip"] == dev_obj["ip"]), None)
+            if existing:
+                dev_obj = existing
+            else:
                 save_device(dev_obj)
             formatted_devices.append(dev_obj)
 
         return {"ok": True, "devices": formatted_devices, "count": len(formatted_devices)}
     except Exception as e:
         logger.error(f"EVE-NG scan error: {e}")
-        return {"ok": True, "devices": [], "count": 0, "error": str(e)}
+        return {"ok": False, "devices": [], "count": 0, "error": str(e)}
 
 
 # ------------------ WEBSOCKET ENDPOINT ------------------ #

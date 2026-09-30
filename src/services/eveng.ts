@@ -74,6 +74,8 @@ export async function scanEveNGLab(
     }
     
     const data = await response.json();
+    if (!data.ok) throw new Error(data.error || 'EVE-NG scan failed');
+    if (data.error) throw new Error(data.error);
     console.log(`✅ EVE-NG scan complete: ${data.count} devices found`);
     return data.devices || [];
     

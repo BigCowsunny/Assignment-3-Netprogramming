@@ -11,10 +11,8 @@ import {
   TrapEvent,
   ViewName,
 } from '../types/snmp';
-import {
-  createSwitchPorts,
-} from '../data/initialData';
 import { fmtHM } from '../utils/formatters';
+import { scanEveNGLab, scanNetwork } from '../services/eveng';
 import {
   checkBackendHealth,
   fetchDevicesApi,
@@ -25,7 +23,6 @@ import {
   fetchEventsApi,
   fetchAuditLogsApi,
   triggerBackendTestTrapApi,
-  runDiscoveryApi,
   connectTrapWebSocket,
 } from '../services/api';
 
@@ -75,7 +72,7 @@ interface SnmpContextType {
   openConfirm: (options: ConfirmDialogOptions) => void;
   closeConfirm: () => void;
   triggerTestTrap: () => void;
-  runDiscovery: () => Promise<void>;
+  runDiscovery: (options?: { mode: 'network' | 'eveng'; network?: string; host?: string; communities?: string; username?: string; password?: string }) => Promise<void>;
   updateTopologyPos: (id: string, x: number, y: number) => void;
   setTopologyZoom: (zoom: number | ((prev: number) => number)) => void;
   refreshDeviceData: () => void;
@@ -423,36 +420,37 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     );
   };
 
-  const runDiscovery = async (): Promise<void> => {
-    if (discoveryFound) {
-      addToast('', 'สแกนเสร็จแล้ว', 'ไม่พบอุปกรณ์ใหม่เพิ่มเติมจาก LLDP/CDP');
-      return;
-    }
-
-    setDiscoveryFound(true);
+  const runDiscovery = async (options: { mode: 'network' | 'eveng'; network?: string; host?: string; communities?: string; username?: string; password?: string } = { mode: 'network' }): Promise<void> => {
     try {
-      localStorage.setItem('od-found', 'true');
-    } catch {}
+      const found = options.mode === 'eveng'
+        ? await scanEveNGLab(options.host?.trim() || '', 32768, 32775, options.username || 'admin', options.password || 'eve', true)
+        : await scanNetwork(options.network?.trim() || '192.168.1.0/24', (options.communities || 'public').split(',').map((value) => value.trim()).filter(Boolean));
 
-    const newSwitch: Device = {
-      id: 'd7',
-      name: 'Access-SW-05',
-      ip: '192.168.10.15',
-      type: 'switch',
-      vendor: 'Cisco C1000-24T',
-      descr: 'Cisco IOS Software, C1000 Software (C1000-LANBASEK9-M), Version 15.2(7)E7',
-      ver: 'v2c',
-      rw: true,
-      status: 'online',
-      up: '12 วัน 06:30:11',
-      ports: createSwitchPorts(77, {}),
-    };
-
-    setDevices((prev) => [...prev, newSwitch]);
-    updateTopologyPos('d7', 662, 436);
-    setTopologyLinks((prev) => [...prev, { a: 'd4', pa: 'Fa0/2', b: 'd7', pb: 'Fa0/1' }]);
-    addAuditLog('Auto Discovery', '192.168.10.0/24', 'สำเร็จ');
-    addToast('ok', 'Discovery เสร็จสิ้น', 'พบ Access-SW-05 ผ่าน LLDP · เพิ่มเข้า monitor แล้ว');
+      const normalized = found as Device[];
+      const knownIps = new Set(devices.map((device) => device.ip));
+      const added = normalized.filter((device) => !knownIps.has(device.ip));
+      setDevices((prev) => {
+        const byIp = new Map(prev.map((device) => [device.ip, device]));
+        for (const device of normalized) {
+          if (!byIp.has(device.ip)) byIp.set(device.ip, device);
+        }
+        return [...byIp.values()];
+      });
+      setTopologyPos((prev) => {
+        const next = { ...prev };
+        added.forEach((device, index) => {
+          if (!next[device.id]) next[device.id] = { x: 150 + ((Object.keys(next).length + index) % 4) * 190, y: 100 + (Math.floor((Object.keys(next).length + index) / 4) % 3) * 130 };
+        });
+        try { localStorage.setItem('od-topo', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      setDiscoveryFound(true);
+      addAuditLog(`Auto Discovery (${options.mode === 'eveng' ? 'EVE-NG' : 'SNMP'})`, options.mode === 'eveng' ? options.host || '' : options.network || '', 'สำเร็จ');
+      addToast('ok', 'Discovery เสร็จสิ้น', `พบ ${normalized.length} อุปกรณ์ · เพิ่มใหม่ ${added.length} อุปกรณ์`);
+    } catch (error) {
+      addAuditLog('Auto Discovery', options.mode === 'eveng' ? options.host || '' : options.network || '', 'ล้มเหลว');
+      addToast('bad', 'Discovery ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และข้อมูลการเชื่อมต่อ');
+    }
   };
 
   const updateTopologyPos = (id: string, x: number, y: number) => {

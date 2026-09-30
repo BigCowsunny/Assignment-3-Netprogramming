@@ -8,6 +8,7 @@ import socket
 import ipaddress
 from typing import List, Dict, Optional
 import logging
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("network_scanner")
 
@@ -54,8 +55,9 @@ async def scan_snmp(host: str, community: str = "public") -> Optional[Dict]:
         sysDescr = str(varBinds[1][1]) if len(varBinds) > 1 else ""
         
         # Determine device type
+        description = sysDescr.lower()
         device_type = "router"
-        if "switch" in sysDescr.lower():
+        if any(token in description for token in ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k", "cat3k", "cat4k")):
             device_type = "switch"
         
         return {
@@ -131,18 +133,25 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
     import urllib.request
     import json
     
-    clean_host = host.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+    raw_host = host.strip()
+    parsed_host = urlsplit(raw_host if "://" in raw_host else f"http://{raw_host}")
+    clean_host = parsed_host.hostname or ""
     if not clean_host:
         return []
 
-    url_base = f"http://{clean_host}"
+    url_base = f"{parsed_host.scheme}://{parsed_host.netloc}"
     devices = []
     
     def sync_api_call():
         try:
             import http.cookiejar
+            import ssl
             cj = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            handlers = [urllib.request.HTTPCookieProcessor(cj)]
+            if parsed_host.scheme == "https":
+                # EVE-NG commonly uses a self-signed certificate on local labs.
+                handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+            opener = urllib.request.build_opener(*handlers)
             
             # 1. Login
             login_url = f"{url_base}/api/auth/login"
@@ -160,9 +169,15 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
             try:
                 with opener.open(req_labs, timeout=2.0) as res:
                     folder_data = json.loads(res.read().decode('utf-8'))
-                    labs = folder_data.get("data", {}).get("labs", [])
-                    for l in labs:
-                        lab_files.append(l.get("path") or l.get("name"))
+                    data = folder_data.get("data", {})
+                    labs = data.get("labs", data.get("folders", [])) if isinstance(data, dict) else []
+                    if isinstance(labs, dict):
+                        labs = list(labs.values())
+                    for lab in labs if isinstance(labs, list) else []:
+                        if isinstance(lab, dict):
+                            lab_files.append(lab.get("path") or lab.get("name"))
+                        elif isinstance(lab, str):
+                            lab_files.append(lab)
             except Exception:
                 pass
                 
@@ -174,8 +189,9 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
             for lab_path in lab_files:
                 if not lab_path:
                     continue
-                path_clean = lab_path if lab_path.startswith('/') else '/' + lab_path
-                node_url = f"{url_base}/api/labs{path_clean}/nodes"
+                path_clean = lab_path.strip('/')
+                node_path = f"/api/labs/{path_clean}/nodes" if path_clean else "/api/labs/nodes"
+                node_url = f"{url_base}{node_path}"
                 try:
                     req_nodes = urllib.request.Request(node_url, method='GET')
                     with opener.open(req_nodes, timeout=2.0) as res:
@@ -195,24 +211,27 @@ async def scan_eveng_api(host: str, username: str = "admin", password: str = "ev
         nodes = await asyncio.to_thread(sync_api_call)
         for n in nodes:
             name = n.get("name", "EVE-Node")
-            status_num = n.get("status", 0)  # 2 = running, 0 = stopped
+            try:
+                status_num = int(n.get("status", 0))  # 2 = running, 0 = stopped
+            except (TypeError, ValueError):
+                status_num = 0
             node_status = "online" if status_num == 2 else "offline"
             url_str = n.get("url", "")  # telnet://ip:port
-            port = 32768
-            if url_str and ":" in url_str:
-                try:
-                    port = int(url_str.split(":")[-1])
-                except ValueError:
-                    pass
+            try:
+                console_port = urlsplit(url_str).port if url_str else None
+            except ValueError:
+                console_port = None
 
             template = str(n.get("template", "")).lower()
+            image = str(n.get("image", "")).lower()
             name_lower = name.lower()
-            dev_type = "switch" if ("sw" in name_lower or "switch" in name_lower or "l2" in template) else "router"
+            dev_type = "switch" if ("switch" in name_lower or "sw" in name_lower or "l2" in template or ("iol" in template and "l2" in image)) else "router"
 
             devices.append({
                 "name": name,
-                "ip": f"{clean_host}:{port}",
-                "port": port,
+                # Preserve uniqueness for stopped nodes without a console URL.
+                "ip": f"{clean_host}:{console_port}" if console_port else f"{clean_host}:node-{n.get('id', name)}",
+                "port": console_port,
                 "type": dev_type,
                 "vendor": f"Cisco {n.get('image', 'EVE-NG')}",
                 "descr": f"EVE-NG Node ({n.get('template', 'QEMU')})",
@@ -293,7 +312,9 @@ async def scan_eveng_ports(
     """
     Scan EVE-NG via REST API first, then Telnet console ports
     """
-    clean_host = host.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+    raw_host = host.strip()
+    parsed_host = urlsplit(raw_host if "://" in raw_host else f"http://{raw_host}")
+    clean_host = parsed_host.hostname or ""
     if not clean_host:
         return []
 

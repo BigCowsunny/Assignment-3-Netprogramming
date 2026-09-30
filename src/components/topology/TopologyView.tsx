@@ -12,7 +12,6 @@ export const TopologyView: React.FC = () => {
     setTopologyZoom,
     updateTopologyPos,
     runDiscovery,
-    discoveryFound,
     openDevice,
   } = useSnmp();
 
@@ -24,6 +23,10 @@ export const TopologyView: React.FC = () => {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoverProgress, setDiscoverProgress] = useState(0);
+  const [scanMode, setScanMode] = useState<'network' | 'eveng'>('network');
+  const [network, setNetwork] = useState('192.168.1.0/24');
+  const [communities, setCommunities] = useState('public,private');
+  const [evengHost, setEvengHost] = useState('192.168.213.1');
 
   const [dragState, setDragState] = useState<{
     nodeId: string;
@@ -32,30 +35,14 @@ export const TopologyView: React.FC = () => {
     hasMoved: boolean;
   } | null>(null);
 
-  const handleDiscover = () => {
-    if (discoveryFound) {
-      runDiscovery();
-      return;
-    }
-
+  const handleDiscover = async () => {
     setIsDiscovering(true);
     setDiscoverProgress(0);
-
-    const interval = setInterval(() => {
-      setDiscoverProgress((prev) => {
-        const next = prev + 6 + Math.random() * 10;
-        if (next >= 100) {
-          clearInterval(interval);
-          setTimeout(() => {
-            setIsDiscovering(false);
-            setDiscoverProgress(0);
-            runDiscovery();
-          }, 400);
-          return 100;
-        }
-        return next;
-      });
-    }, 150);
+    setDiscoverProgress(35);
+    await runDiscovery(scanMode === 'eveng' ? { mode: 'eveng', host: evengHost } : { mode: 'network', network, communities });
+    setDiscoverProgress(100);
+    setIsDiscovering(false);
+    setTimeout(() => setDiscoverProgress(0), 500);
   };
 
   const getSvgCoordinates = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -126,7 +113,7 @@ export const TopologyView: React.FC = () => {
       <div className="page-head">
         <div>
           <h1>โทโพโลยี</h1>
-          <p>ตรวจหาอุปกรณ์ด้วย LLDP/CDP · ลากเพื่อจัดตำแหน่ง · คลิกโหนดเพื่อเปิด Port Panel</p>
+          <p>สแกนอุปกรณ์จริงผ่าน SNMP หรือค้นหา node ใน EVE-NG</p>
         </div>
 
         <div className="hero-stats">
@@ -135,14 +122,28 @@ export const TopologyView: React.FC = () => {
               <i style={{ width: `${discoverProgress}%` }}></i>
             </div>
           )}
-          <button
-            className="btn btn-primary"
-            onClick={handleDiscover}
-            disabled={isDiscovering}
-          >
-            <Icon name="i-radar" />
-            Discover
-          </button>
+          <div className="toolbar" style={{ marginBottom: 0 }}>
+            <select aria-label="วิธีค้นหาอุปกรณ์" value={scanMode} onChange={(e) => setScanMode(e.target.value as 'network' | 'eveng')} disabled={isDiscovering}>
+              <option value="network">เครือข่ายจริง (SNMP)</option>
+              <option value="eveng">EVE-NG</option>
+            </select>
+            {scanMode === 'network' ? (
+              <>
+                <input aria-label="Subnet ที่ต้องการสแกน" value={network} onChange={(e) => setNetwork(e.target.value)} placeholder="192.168.1.0/24" disabled={isDiscovering} />
+                <input aria-label="SNMP communities" value={communities} onChange={(e) => setCommunities(e.target.value)} placeholder="SNMP communities คั่นด้วย comma" disabled={isDiscovering} />
+              </>
+            ) : (
+              <input aria-label="EVE-NG host" value={evengHost} onChange={(e) => setEvengHost(e.target.value)} placeholder="EVE-NG IP หรือ URL" disabled={isDiscovering} />
+            )}
+            <button
+              className="btn btn-primary"
+              onClick={handleDiscover}
+              disabled={isDiscovering || (scanMode === 'network' ? !network.trim() : !evengHost.trim())}
+            >
+              <Icon name="i-radar" />
+              Discover
+            </button>
+          </div>
         </div>
       </div>
 
