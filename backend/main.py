@@ -34,7 +34,7 @@ from snmp_engine import snmp_get_system_info, snmp_set_admin_status, snmp_walk_i
 from trap_receiver import start_trap_listener, ws_manager
 from poller import run_poller_loop
 from discovery import discover_network, discover_topology_links
-from network_scanner import scan_network, scan_eveng_ports
+from network_scanner import scan_network
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -443,18 +443,9 @@ def _scanned_device_record(device: Dict[str, Any], index: int) -> Dict[str, Any]
     }
 
 
-class EveNGScanRequest(BaseModel):
-    host: str = "192.168.213.1"
-    start_port: int = 32768
-    end_port: int = 32775
-    username: str = "admin"
-    password: str = "eve"
-    auto_save: bool = False
-
-
 @app.post("/api/network/scan")
 async def network_scan_endpoint(req: NetworkScanRequest):
-    """Network scan to discover devices via SNMP/Telnet"""
+    """Discover devices by SNMP GET and IF-MIB walk only."""
     logger.info(f"Network scan request: {req.network}")
     try:
         scanned = await scan_network(req.network, req.communities, req.max_concurrent)
@@ -465,17 +456,8 @@ async def network_scan_endpoint(req: NetworkScanRequest):
             if not ip:
                 continue
             community = result.get("community", req.communities[0] if req.communities else "public")
-            probe = await snmp_get_system_info(ip, community)
-            if probe.get("ok"):
-                result["name"] = probe.get("name") or result.get("name")
-                result["descr"] = probe.get("descr") or result.get("descr", "")
-                result["up"] = probe.get("uptime", "0 วัน 00:00:00")
-                result["ports"] = await snmp_walk_interfaces(ip, community)
-            if not probe.get("ok") or not result.get("ports"):
+            if not result.get("ports"):
                 continue
-                descr_lower = result["descr"].lower()
-                switch_markers = ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k", "cat3k", "cat4k")
-                result["type"] = "switch" if any(word in descr_lower for word in switch_markers) else result.get("type", "router")
             if ip in existing_by_ip:
                 record = {**existing_by_ip[ip], **_scanned_device_record(result, index), "id": existing_by_ip[ip]["id"]}
                 save_device(record)
@@ -489,30 +471,6 @@ async def network_scan_endpoint(req: NetworkScanRequest):
     except Exception as e:
         logger.error(f"Network scan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/eveng/scan")
-async def eveng_scan_endpoint(req: EveNGScanRequest):
-    """Scan EVE-NG REST API and console ports for devices"""
-    logger.info(f"EVE-NG scan request: {req.host}:{req.start_port}-{req.end_port}")
-    try:
-        devices = await scan_eveng_ports(
-            req.host,
-            req.start_port,
-            req.end_port,
-            req.username,
-            req.password
-        )
-        
-        # EVE console endpoints identify the terminal service, not the node's
-        # management IP. Return inventory only; SNMP monitor records are made
-        # from reachable management IPs via /api/devices or the subnet sweep.
-        return {"ok": True, "devices": devices, "count": len(devices), "inventory_only": True}
-    except Exception as e:
-        logger.error(f"EVE-NG scan error: {e}")
-        return {"ok": False, "devices": [], "count": 0, "error": str(e)}
-
-
 # ------------------ WEBSOCKET ENDPOINT ------------------ #
 
 @app.websocket("/ws/events")

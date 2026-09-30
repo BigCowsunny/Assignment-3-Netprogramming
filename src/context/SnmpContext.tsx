@@ -11,7 +11,7 @@ import {
   TrapEvent,
   ViewName,
 } from '../types/snmp';
-import { scanEveNGLab, scanNetwork } from '../services/eveng';
+import { scanNetwork } from '../services/networkDiscovery';
 import {
   checkBackendHealth,
   fetchDevicesApi,
@@ -72,7 +72,7 @@ interface SnmpContextType {
   openConfirm: (options: ConfirmDialogOptions) => void;
   closeConfirm: () => void;
   triggerTestTrap: () => void;
-  runDiscovery: (options?: { mode: 'network' | 'eveng'; network?: string; host?: string; communities?: string; username?: string; password?: string }) => Promise<void>;
+  runDiscovery: (options?: { network?: string; communities?: string }) => Promise<void>;
   updateTopologyPos: (id: string, x: number, y: number) => void;
   setTopologyZoom: (zoom: number | ((prev: number) => number)) => void;
   refreshDeviceData: () => void;
@@ -418,30 +418,19 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }).catch((error) => addToast('bad', 'ส่ง Test Trap ไม่สำเร็จ', error instanceof Error ? error.message : String(error)));
   };
 
-  const runDiscovery = async (options: { mode: 'network' | 'eveng'; network?: string; host?: string; communities?: string; username?: string; password?: string } = { mode: 'network' }): Promise<void> => {
+  const runDiscovery = async (options: { network?: string; communities?: string } = {}): Promise<void> => {
     try {
-      const found = options.mode === 'eveng'
-        ? await scanEveNGLab(options.host?.trim() || '', 32768, 32775, options.username || 'admin', options.password || 'eve', true)
-        : await scanNetwork(options.network?.trim() || '192.168.1.0/24', (options.communities || 'public').split(',').map((value) => value.trim()).filter(Boolean));
-
-      if (options.mode === 'eveng') {
-        const names = found.map((node: any) => node.name).filter(Boolean);
-        setDiscoveryFound(true);
-        addAuditLog('EVE-NG Lab Inventory', options.host || '', 'สำเร็จ');
-        addToast('ok', `พบ ${names.length} Node ใน EVE-NG`, names.length
-          ? `${names.join(', ')} · ใส่ management IP ของ node ใน “เพิ่มด้วย IP” หรือสแกน management subnet เพื่อดึงพอร์ตผ่าน SNMP`
-          : 'ไม่พบ Node ที่กำลังทำงานใน Lab');
-        return;
-      }
+      const found = await scanNetwork(
+        options.network?.trim() || '192.168.1.0/24',
+        (options.communities || 'public').split(',').map((value) => value.trim()).filter(Boolean),
+      );
 
       const normalized = found as Device[];
       const knownIps = new Set(devices.map((device) => device.ip));
       const added = normalized.filter((device) => !knownIps.has(device.ip));
       setDevices((prev) => {
         const byIp = new Map(prev.map((device) => [device.ip, device]));
-        for (const device of normalized) {
-          if (!byIp.has(device.ip)) byIp.set(device.ip, device);
-        }
+        for (const device of normalized) byIp.set(device.ip, device);
         return [...byIp.values()];
       });
       setTopologyPos((prev) => {
@@ -455,10 +444,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setDiscoveryFound(true);
       const topology = await fetchTopologyApi().catch(() => null);
       if (topology) setTopologyLinks(topology.links || []);
-      addAuditLog(`Auto Discovery (${options.mode === 'eveng' ? 'EVE-NG' : 'SNMP'})`, options.mode === 'eveng' ? options.host || '' : options.network || '', 'สำเร็จ');
+      addAuditLog('Auto Discovery (SNMP)', options.network || '', 'สำเร็จ');
       addToast('ok', 'Discovery เสร็จสิ้น', `พบ ${normalized.length} อุปกรณ์ · เพิ่มใหม่ ${added.length} อุปกรณ์`);
     } catch (error) {
-      addAuditLog('Auto Discovery', options.mode === 'eveng' ? options.host || '' : options.network || '', 'ล้มเหลว');
+      addAuditLog('Auto Discovery (SNMP)', options.network || '', 'ล้มเหลว');
       addToast('bad', 'Discovery ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และข้อมูลการเชื่อมต่อ');
     }
   };
@@ -533,6 +522,20 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         }));
       } else if (message.type === 'DEVICE_STATUS_CHANGE') {
         setDevices((prev) => prev.map((device) => device.id === message.device_id ? { ...device, status: message.status, up: message.uptime || device.up } : device));
+      } else if (message.type === 'DEVICE_DISCOVERED' && message.device) {
+        const discovered = message.device as Device;
+        setDevices((prev) => prev.some((device) => device.ip === discovered.ip)
+          ? prev.map((device) => device.ip === discovered.ip ? discovered : device)
+          : [...prev, discovered]);
+        setTopologyPos((prev) => {
+          if (prev[discovered.id]) return prev;
+          const index = Object.keys(prev).length;
+          const next = { ...prev, [discovered.id]: { x: 150 + (index % 4) * 190, y: 100 + (Math.floor(index / 4) % 3) * 130 } };
+          try { localStorage.setItem('od-topo', JSON.stringify(next)); } catch {}
+          return next;
+        });
+        addAuditLog('Auto Discovery via SNMP Trap', discovered.ip, 'สำเร็จ');
+        addToast('ok', 'พบอุปกรณ์จาก SNMP Trap', `${discovered.name} · ${discovered.ip} · ${discovered.ports.length} interfaces`);
       }
     });
     return () => socket?.close();

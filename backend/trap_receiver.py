@@ -13,7 +13,8 @@ from fastapi import WebSocket
 from pyasn1.codec.ber import decoder
 from pysnmp.proto import api
 
-from database import add_event, get_all_devices, update_interface_status
+from database import add_audit_log, add_event, get_all_devices, save_device, update_interface_status
+from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
 
 logger = logging.getLogger("trap_receiver")
 
@@ -46,6 +47,58 @@ class WebSocketManager:
 
 
 ws_manager = WebSocketManager()
+
+
+async def _discover_from_trap(source_ip: str, community: str) -> Optional[dict]:
+    """Enroll an unknown trap sender only after SNMP GET and IF-MIB confirm it."""
+    current = next((item for item in get_all_devices() if item.get("ip") == source_ip), None)
+    if current:
+        return current
+
+    if not community:
+        logger.warning("Cannot discover SNMP trap source %s without a community", source_ip)
+        return None
+
+    info = await snmp_get_system_info(source_ip, community, timeout=2.0)
+    if not info.get("ok"):
+        logger.warning("Trap received from %s, but SNMP GET with the trap community failed", source_ip)
+        return None
+
+    interfaces = await snmp_walk_interfaces(source_ip, community, timeout=2.5)
+    if not interfaces:
+        logger.warning("Trap received from %s, but SNMP returned no interfaces", source_ip)
+        return None
+
+    descr = info.get("descr", "")
+    lowered = descr.lower()
+    switch_markers = ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k")
+    safe_ip = "".join(char if char.isalnum() else "_" for char in source_ip)
+    device = {
+        "id": f"trap_{safe_ip}"[:80],
+        "name": info.get("name") or f"SNMP-{source_ip}",
+        "ip": source_ip,
+        "ver": "v2c",
+        "community": community,
+        "snmp_port": 161,
+        "type": "switch" if any(marker in lowered for marker in switch_markers) else "router",
+        "vendor": descr[:48] or "SNMP device",
+        "descr": descr,
+        "status": "online",
+        "up": info.get("uptime", "0"),
+        "ports": interfaces,
+    }
+    # A subnet scan or another trap may have enrolled this IP while the SNMP
+    # requests above were in flight. Preserve its stable ID in that case.
+    current = next((item for item in get_all_devices() if item.get("ip") == source_ip), None)
+    if current:
+        device["id"] = current["id"]
+    save_device(device)
+    add_audit_log("snmp-trap", "Auto Discovery via SNMP Trap", source_ip, "สำเร็จ")
+
+    saved = next((item for item in get_all_devices() if item["ip"] == source_ip), device)
+    await ws_manager.broadcast({"type": "DEVICE_DISCOVERED", "device": saved})
+    logger.info("Auto-discovered SNMP device %s (%s) with %s interfaces", saved["name"], source_ip, len(interfaces))
+    return saved
 
 
 class SnmpTrapProtocol(asyncio.DatagramProtocol):
@@ -124,8 +177,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                     trap_type = "linkUp"
                     trap_oid = OID_LINK_UP
                 else:
-                    trap_type = "linkDown"
-                    trap_oid = OID_LINK_DOWN
+                    return None
 
             return {
                 "source_ip": src_ip,
@@ -144,7 +196,9 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 msg, _ = decoder.decode(data, asn1Spec=api.v1.Message())
                 pdu = api.v1.apiMessage.get_pdu(msg)
                 generic_trap = int(api.v1.apiTrapPDU.get_generic_trap(pdu))
-                trap_type = "linkDown" if generic_trap == 2 else "linkUp" if generic_trap == 3 else "linkDown"
+                if generic_trap not in (2, 3):
+                    return None
+                trap_type = "linkDown" if generic_trap == 2 else "linkUp"
                 return {
                     "source_ip": src_ip,
                     "community": str(api.v1.apiMessage.get_community(msg)),
@@ -172,6 +226,9 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
             if dev["ip"] == src_ip:
                 matched_dev = dev
                 break
+
+        if not matched_dev:
+            matched_dev = await _discover_from_trap(src_ip, trap_data.get("community", ""))
 
         device_id = matched_dev["id"] if matched_dev else "unknown"
         device_name = matched_dev["name"] if matched_dev else "Unknown Source"

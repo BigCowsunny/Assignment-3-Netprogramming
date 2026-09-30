@@ -5,7 +5,7 @@ import { AddDeviceModal } from './AddDeviceModal';
 import { EditDeviceModal } from './EditDeviceModal';
 import { Device } from '../../types/snmp';
 import { scanSerial, scanSerialWithPort } from '../../services/serial';
-import { scanEveNGLab, scanNetwork } from '../../services/eveng';
+import { scanNetwork } from '../../services/networkDiscovery';
 
 export const DevicesView: React.FC = () => {
   const {
@@ -29,13 +29,8 @@ export const DevicesView: React.FC = () => {
   const [scanning, setScanning] = useState(false);
   const [autoScanned, setAutoScanned] = useState(false);
   const [showEveNGModal, setShowEveNGModal] = useState(false);
-  const [eveNGHost, setEveNGHost] = useState('192.168.213.1');
-  const [eveNGNetwork, setEveNGNetwork] = useState('192.168.213.0/24');
-  const [eveNGStartPort, setEveNGStartPort] = useState(32768);
-  const [eveNGEndPort, setEveNGEndPort] = useState(32775);
-  const [eveNGUser, setEveNGUser] = useState('admin');
-  const [eveNGPass, setEveNGPass] = useState('eve');
-  const [scanMode, setScanMode] = useState<'api' | 'telnet' | 'network'>('api');
+  const [scanNetworkCidr, setScanNetworkCidr] = useState('192.168.213.0/24');
+  const [scanCommunities, setScanCommunities] = useState('public,private');
 
   const handleAutoScanAll = async () => {
     setScanning(true);
@@ -130,7 +125,7 @@ export const DevicesView: React.FC = () => {
     // 2. Scan Network (SNMP)
     console.log('\n🔍 Step 2: Scanning network via SNMP...');
     try {
-      const results = await scanNetwork(eveNGNetwork, ['public', 'private']);
+      const results = await scanNetwork(scanNetworkCidr, scanCommunities.split(',').map((community) => community.trim()).filter(Boolean));
       
       for (const result of results) {
         if (!result.name) continue;
@@ -401,81 +396,30 @@ export const DevicesView: React.FC = () => {
     refreshDeviceData();
   };
 
-  const handleEveNGScan = async () => {
+  const handleNetworkScan = async () => {
     setScanning(true);
     setShowEveNGModal(false);
-    
-    if (scanMode === 'network') {
-      // Network scan mode
-      addToast('', 'Scanning Network...', `${eveNGNetwork}`);
-      
-      try {
-        const results = await scanNetwork(eveNGNetwork, ['public', 'private']);
-        
-        if (results.length === 0) {
-          addToast('', 'ไม่เจออุปกรณ์', 'ตรวจสอบว่า network และ SNMP community ถูกต้อง');
-          setScanning(false);
-          return;
-        }
-        
-        let addedCount = 0;
-        
-        for (const result of results) {
-          if (!result.name) continue;
-          
-          if (devices.some(d => d.name === result.name || d.ip === result.ip)) {
-            console.log(`Device "${result.name}" (${result.ip}) already exists, skipping`);
-            continue;
-          }
-          
-          addDevice(result as Device);
-          addedCount++;
-        }
-        
-        if (addedCount > 0) {
-          addToast('ok', `เจอ ${addedCount} อุปกรณ์!`, `จาก network ${eveNGNetwork}`);
-        } else {
-          addToast('', 'ไม่มีอุปกรณ์ใหม่', 'อุปกรณ์ที่เจอมีอยู่ในระบบแล้ว');
-        }
-        refreshDeviceData();
-        
-      } catch (error: any) {
-        console.error('Network scan error:', error);
-        addToast('bad', 'Scan ล้มเหลว', error.message || 'ไม่สามารถ scan network ได้');
+    addToast('', 'กำลังสแกน SNMP', scanNetworkCidr);
+    try {
+      const results = await scanNetwork(
+        scanNetworkCidr,
+        scanCommunities.split(',').map((community) => community.trim()).filter(Boolean),
+      );
+      let addedCount = 0;
+      for (const result of results) {
+        if (!result.name || devices.some((device) => device.ip === result.ip)) continue;
+        addDevice(result as Device);
+        addedCount++;
       }
-      
-    } else {
-      // EVE-NG API / Telnet scan mode
-      const modeLabel = scanMode === 'api' ? 'EVE-NG REST API' : 'EVE-NG Telnet';
-      addToast('', `Scanning ${modeLabel}...`, `${eveNGHost}`);
-      
-      try {
-        const results = await scanEveNGLab(
-          eveNGHost,
-          eveNGStartPort,
-          eveNGEndPort,
-          eveNGUser,
-          eveNGPass,
-          false
-        );
-        
-        if (results.length === 0) {
-          addToast('', 'ไม่พบอุปกรณ์ใน EVE-NG', 'ตรวจสอบว่า EVE-NG ทำงาน และ Node เปิดอยู่ (Running state)');
-          setScanning(false);
-          return;
-        }
-        
-        const names = results.map((result: any) => result.name).filter(Boolean);
-        addToast('ok', `พบ ${names.length} Node ใน EVE-NG`, names.length
-          ? `${names.join(', ')} · ใช้ management IP ใน “เพิ่มด้วย IP” หรือสแกน management subnet เพื่ออ่านพอร์ตด้วย SNMP`
-          : 'ไม่พบ Node ที่กำลังทำงานใน Lab');
-        
-      } catch (error: any) {
-        console.error('EVE-NG scan error:', error);
-        addToast('bad', 'Scan ล้มเหลว', error.message || 'ไม่สามารถเชื่อมต่อ EVE-NG');
-      }
+      addToast(
+        addedCount ? 'ok' : '',
+        addedCount ? `พบอุปกรณ์ใหม่ ${addedCount} เครื่อง` : 'ไม่พบอุปกรณ์ใหม่',
+        `ตรวจพบผ่าน SNMP ใน ${scanNetworkCidr}`,
+      );
+      refreshDeviceData();
+    } catch (error) {
+      addToast('bad', 'SNMP scan ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และ network');
     }
-    
     setScanning(false);
   };
 
@@ -651,7 +595,7 @@ export const DevicesView: React.FC = () => {
         onClose={() => setEditingDevice(null)}
       />
       
-      {/* EVE-NG Scan Modal */}
+      {/* SNMP network scan modal */}
       {showEveNGModal && (
         <div className="modal-backdrop" onClick={() => setShowEveNGModal(false)}>
           <div
@@ -661,8 +605,8 @@ export const DevicesView: React.FC = () => {
           >
             <div className="sheet-head">
               <div>
-                <h2>Auto-Discovery EVE-NG / Network</h2>
-                <p>สแกนหาอุปกรณ์อัตโนมัติผ่าน SNMP หรือ Telnet</p>
+                <h2>ค้นหาอุปกรณ์ด้วย SNMP</h2>
+                <p>ค้นหาอุปกรณ์จริงหรือ node ใน EVE-NG ที่เปิด SNMP และมี Management IP</p>
               </div>
               <button className="icon-btn" onClick={() => setShowEveNGModal(false)}>
                 <Icon name="i-x" />
@@ -670,143 +614,30 @@ export const DevicesView: React.FC = () => {
             </div>
 
             <div className="sheet-body">
-              {/* Scan Mode Selector */}
-              <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-                <button
-                  className={`btn ${scanMode === 'api' ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => setScanMode('api')}
-                  style={{ flex: 1 }}
-                >
-                  <Icon name="i-server" />
-                  EVE-NG REST API
-                </button>
-                <button
-                  className={`btn ${scanMode === 'telnet' ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => setScanMode('telnet')}
-                  style={{ flex: 1 }}
-                >
-                  <Icon name="i-radar" />
-                  Telnet Console
-                </button>
-                <button
-                  className={`btn ${scanMode === 'network' ? 'btn-primary' : 'btn-ghost'}`}
-                  onClick={() => setScanMode('network')}
-                  style={{ flex: 1 }}
-                >
-                  <Icon name="i-topo" />
-                  SNMP Sweep
-                </button>
+              <div className="field">
+                <label>Network CIDR</label>
+                <input
+                  type="text"
+                  value={scanNetworkCidr}
+                  onChange={(e) => setScanNetworkCidr(e.target.value)}
+                  placeholder="192.168.213.0/24"
+                />
+                <small className="hint">ระบุ subnet ของ Management IP ที่ Backend เข้าถึงได้</small>
               </div>
-
-              {scanMode === 'api' ? (
-                <>
-                  <div className="field">
-                    <label>EVE-NG Host IP</label>
-                    <input
-                      type="text"
-                      value={eveNGHost}
-                      onChange={(e) => setEveNGHost(e.target.value)}
-                      placeholder="192.168.213.1 หรือ 192.168.1.100"
-                    />
-                    <small className="hint">IP Address ของ EVE-NG Server</small>
-                  </div>
-
-                  <div className="fgrid">
-                    <div className="field">
-                      <label>Username</label>
-                      <input
-                        type="text"
-                        value={eveNGUser}
-                        onChange={(e) => setEveNGUser(e.target.value)}
-                        placeholder="admin"
-                      />
-                    </div>
-                    <div className="field">
-                      <label>Password</label>
-                      <input
-                        type="password"
-                        value={eveNGPass}
-                        onChange={(e) => setEveNGPass(e.target.value)}
-                        placeholder="eve"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="testbox on" style={{ background: '#e8f5e9', borderColor: '#4caf50' }}>
-                    <b>⚡ EVE-NG REST API (แนะนำ)</b>
-                    <ul style={{ marginTop: '8px', paddingLeft: '20px', fontSize: '13px' }}>
-                      <li>เชื่อมต่อ EVE-NG API อัตโนมัติ</li>
-                      <li>ดึง Router / Switch จาก Lab ที่เปิดอยู่ออกมาแสดงผล</li>
-                      <li>ไม่ต้องสแกนสุ่ม IP หรือ Telnet Port</li>
-                    </ul>
-                  </div>
-                </>
-              ) : scanMode === 'telnet' ? (
-                <>
-                  <div className="field">
-                    <label>EVE-NG Host IP</label>
-                    <input
-                      type="text"
-                      value={eveNGHost}
-                      onChange={(e) => setEveNGHost(e.target.value)}
-                      placeholder="192.168.213.1"
-                    />
-                  </div>
-
-                  <div className="fgrid">
-                    <div className="field">
-                      <label>Start Port</label>
-                      <input
-                        type="number"
-                        value={eveNGStartPort}
-                        onChange={(e) => setEveNGStartPort(parseInt(e.target.value))}
-                        placeholder="32768"
-                      />
-                    </div>
-                    <div className="field">
-                      <label>End Port</label>
-                      <input
-                        type="number"
-                        value={eveNGEndPort}
-                        onChange={(e) => setEveNGEndPort(parseInt(e.target.value))}
-                        placeholder="32775"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="testbox on">
-                    <b>💡 EVE-NG Telnet Console Ports</b>
-                    <ul style={{ marginTop: '8px', paddingLeft: '20px', fontSize: '13px' }}>
-                      <li>สแกนพอร์ต Telnet ใน EVE-NG (ปกติ 32768-32775)</li>
-                      <li>ระบบจะส่งสัญญาณ `\r\n` เพื่ออ่าน hostname และชนิดอุปกรณ์ (Router/Switch)</li>
-                    </ul>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="field">
-                    <label>Network CIDR</label>
-                    <input
-                      type="text"
-                      value={eveNGNetwork}
-                      onChange={(e) => setEveNGNetwork(e.target.value)}
-                      placeholder="192.168.213.0/24"
-                    />
-                    <small className="hint">
-                      ใส่ network ที่ต้องการ scan (เช่น VMnet8: 192.168.213.0/24)
-                    </small>
-                  </div>
-
-                  <div className="testbox on" style={{ background: '#e3f2fd', borderColor: '#2196f3' }}>
-                    <b>🌐 Network SNMP Sweep</b>
-                    <ul style={{ marginTop: '8px', paddingLeft: '20px', fontSize: '13px' }}>
-                      <li>Scan ทั้ง subnet หาอุปกรณ์ที่เปิด SNMP</li>
-                      <li>ลอง SNMP community: public, private</li>
-                      <li>ดึง sysName, sysDescr และ Interfaces จริง</li>
-                    </ul>
-                  </div>
-                </>
-              )}
+              <div className="field">
+                <label>SNMP communities</label>
+                <input
+                  type="text"
+                  value={scanCommunities}
+                  onChange={(e) => setScanCommunities(e.target.value)}
+                  placeholder="public,private"
+                />
+                <small className="hint">ใส่ community คั่นด้วย comma; ระบบจะแสดงอุปกรณ์เมื่ออ่าน SNMP และ IF-MIB ได้</small>
+              </div>
+              <div className="testbox on" style={{ background: '#e3f2fd', borderColor: '#2196f3' }}>
+                <b>ค้นพบผ่าน SNMP เท่านั้น</b>
+                <p style={{ marginTop: '8px', fontSize: '13px' }}>ใช้ได้กับอุปกรณ์จริงและ EVE-NG node เมื่อเปิด SNMP บน node และกำหนด Management IP ที่เข้าถึงได้</p>
+              </div>
             </div>
 
             <div className="sheet-foot">
@@ -815,11 +646,11 @@ export const DevicesView: React.FC = () => {
               </button>
               <button 
                 className="btn btn-primary" 
-                onClick={handleEveNGScan}
-                disabled={scanning}
+                onClick={handleNetworkScan}
+                disabled={scanning || !scanNetworkCidr.trim() || !scanCommunities.trim()}
               >
                 <Icon name="i-radar" />
-                {scanning ? 'Connecting & Fetching...' : 'เชื่อมต่อ & ดึงอุปกรณ์'}
+                {scanning ? 'กำลังสแกน...' : 'สแกนด้วย SNMP'}
               </button>
             </div>
           </div>
