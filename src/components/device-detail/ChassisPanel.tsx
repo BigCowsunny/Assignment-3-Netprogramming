@@ -49,7 +49,10 @@ export const ChassisPanel: React.FC<ChassisPanelProps> = ({ device }) => {
   const renderPortCell = (p: Port) => {
     let stateClass = 'p-up';
     let statusLabel = 'up';
-    if (p.admin === 'down' || p.oper === 'down') {
+    if (p.observed_only || p.admin === 'unknown' || p.oper === 'unknown') {
+      stateClass = 'p-admin-down';
+      statusLabel = 'ยังไม่ทราบสถานะ';
+    } else if (p.admin === 'down' || p.oper === 'down') {
       stateClass = 'p-down';
       statusLabel = 'down';
     }
@@ -75,7 +78,7 @@ export const ChassisPanel: React.FC<ChassisPanelProps> = ({ device }) => {
         <h3>
           Port Panel ·{' '}
           <span className="mono">
-            {device.ports.filter((p) => !p.virtual).length} ports · {device.vendor}
+            {device.ports.filter((p) => !p.virtual).length} {device.discovery_only ? 'ports ที่ CDP/LLDP ประกาศ' : 'ports'} · {device.vendor}
           </span>
         </h3>
         <label className="sw-row" style={{ border: 0, padding: 0, gap: '9px' }}>
@@ -100,7 +103,7 @@ export const ChassisPanel: React.FC<ChassisPanelProps> = ({ device }) => {
         <div className="chassis">
           <div className="chassis-top">
             <span>
-              {device.vendor} · {shownPorts.length} interfaces จาก SNMP
+              {device.vendor} · {shownPorts.length} interfaces จาก {device.discovery_only ? (device.discovery_protocol || 'CDP/LLDP') : 'SNMP'}
             </span>
             <span className="leds">
               <span>

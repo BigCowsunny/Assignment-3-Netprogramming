@@ -3,6 +3,7 @@ import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { ChassisPanel } from './ChassisPanel';
 import { EditDeviceModal } from '../devices/EditDeviceModal';
+import { configurationWarning } from '../../utils/deviceManagement';
 
 export const DeviceDetailView: React.FC = () => {
   const { activeDevice, setView, refreshDeviceData, pollingCountdown } = useSnmp();
@@ -40,14 +41,15 @@ export const DeviceDetailView: React.FC = () => {
               <span className="pill off">
                 {activeDevice.type === 'switch' ? 'Switch' : 'Router'}
               </span>
-              <span className={`pill ${activeDevice.status === 'online' ? 'ok' : 'bad'}`}>
+              <span className={`pill ${activeDevice.status === 'online' ? 'ok' : activeDevice.status === 'discovered' ? 'warn' : 'bad'}`}>
                 <i></i>
-                {activeDevice.status === 'online' ? 'ออนไลน์' : 'ออฟไลน์'}
+                {activeDevice.status === 'online' ? 'ออนไลน์' : activeDevice.status === 'discovered' ? 'พบผ่าน CDP/LLDP' : 'ออฟไลน์'}
               </span>
             </div>
             <p className="mono">
-              {activeDevice.ip} · {activeDevice.vendor} · SNMP {activeDevice.ver} · ตรวจสิทธิ์ SET ที่อุปกรณ์ตอนสั่ง · uptime {activeDevice.up}
+              {activeDevice.ip || 'ไม่มี IP'} · {activeDevice.vendor}{!activeDevice.discovery_only && ` · SNMP ${activeDevice.ver} · ตรวจสิทธิ์ SET ที่อุปกรณ์ตอนสั่ง · uptime ${activeDevice.up}`}
             </p>
+            {configurationWarning(activeDevice) && <p className="hint" role="alert">{configurationWarning(activeDevice)} · แสดงเฉพาะพอร์ตที่ CDP/LLDP ประกาศ ยังไม่ใช่พอร์ตทั้งหมด</p>}
           </div>
         </div>
 
@@ -55,7 +57,7 @@ export const DeviceDetailView: React.FC = () => {
           <div className="hint mono">รีเฟรชถัดไปใน {pollingCountdown} วิ</div>
           <button className="btn" onClick={() => setIsEditOpen(true)}>
             <Icon name="i-set" />
-            แก้ไขอุปกรณ์
+            {activeDevice.discovery_only ? 'ตั้งค่า IP/SNMP' : 'แก้ไขอุปกรณ์'}
           </button>
           <button className="btn" onClick={refreshDeviceData}>
             <Icon name="i-refresh" />
@@ -70,13 +72,13 @@ export const DeviceDetailView: React.FC = () => {
         <div className="sum">
           <div className="lbl">up</div>
           <div className="v" style={{ color: 'oklch(45% 0.13 150)' }}>
-            {upCount}
+            {activeDevice.discovery_only ? '—' : upCount}
           </div>
         </div>
         <div className="sum">
           <div className="lbl">down</div>
           <div className="v" style={{ color: 'oklch(47% 0.17 25)' }}>
-            {downCount}
+            {activeDevice.discovery_only ? '—' : downCount}
           </div>
         </div>
       </div>

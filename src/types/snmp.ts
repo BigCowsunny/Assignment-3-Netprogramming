@@ -1,7 +1,7 @@
 export type DeviceType = 'switch' | 'router';
-export type DeviceStatus = 'online' | 'offline';
-export type AdminStatus = 'up' | 'down';
-export type OperStatus = 'up' | 'down';
+export type DeviceStatus = 'online' | 'offline' | 'discovered';
+export type AdminStatus = 'up' | 'down' | 'unknown';
+export type OperStatus = 'up' | 'down' | 'unknown';
 export type SnmpVersion = 'v2c' | 'v3';
 export type TrapType = 'linkUp' | 'linkDown';
 export type TimeRange = 'live' | 'day' | 'week' | 'month' | 'year';
@@ -18,6 +18,7 @@ export interface Port {
   alias: string;
   virtual: boolean;
   ip: string;
+  observed_only?: boolean;
 }
 
 export interface Device {
@@ -35,6 +36,14 @@ export interface Device {
   status: DeviceStatus;
   up: string;
   ports: Port[];
+  discovery_only?: boolean;
+  can_configure?: boolean;
+  config_unavailable_reason?: string;
+  discovery_protocol?: string;
+  discovery_identity?: string;
+  capture_interface?: string;
+  source_mac?: string;
+  chassis_id?: string;
 }
 
 export interface TrapEvent {
@@ -67,6 +76,7 @@ export interface TopologyLink {
   pa: string; // port A name
   b: string; // device B id
   pb: string; // port B name
+  proto?: string;
 }
 
 export interface TrafficPoint {

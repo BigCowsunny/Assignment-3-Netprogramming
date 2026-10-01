@@ -1,7 +1,7 @@
 import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
-import { shortN } from '../../utils/formatters';
+import { TopologyConnections } from '../topology/TopologyConnections';
 
 export const MiniTopologyCard: React.FC = () => {
   const { devices, topologyPos, topologyLinks, openDevice, setView } = useSnmp();
@@ -32,49 +32,8 @@ export const MiniTopologyCard: React.FC = () => {
           aria-label="แผนภาพโทโพโลยีเครือข่าย (ย่อ)"
         >
           <g className="topo-layer">
-            {/* Links */}
-            {topologyLinks.map((l, i) => {
-              const A = devices.find((d) => d.id === l.a);
-              const B = devices.find((d) => d.id === l.b);
-              const posA = topologyPos[l.a];
-              const posB = topologyPos[l.b];
-              if (!A || !B || !posA || !posB) return null;
-
-              const pa = A.ports.find((p) => p.name === l.pa);
-              const pb = B.ports.find((p) => p.name === l.pb);
-              const isUp =
-                pa?.oper === 'up' &&
-                pb?.oper === 'up' &&
-                A.status === 'online' &&
-                B.status === 'online';
-
-              const mx = (posA.x + posB.x) / 2;
-              const my = (posA.y + posB.y) / 2;
-
-              return (
-                <g key={`minilink-${i}`}>
-                  <line
-                    className={`link ${isUp ? 'up' : 'down'}`}
-                    x1={posA.x}
-                    y1={posA.y}
-                    x2={posB.x}
-                    y2={posB.y}
-                  />
-                  <g className="link-label">
-                    <rect
-                      x={mx - 52}
-                      y={my - 9}
-                      width={104}
-                      height={18}
-                      rx={4}
-                    />
-                    <text x={mx} y={my + 4}>
-                      {shortN(l.pa)} ↔ {shortN(l.pb)}
-                    </text>
-                  </g>
-                </g>
-              );
-            })}
+            {/* Port pairs are deduplicated; shared media use one segment. */}
+            <TopologyConnections devices={devices} positions={topologyPos} links={topologyLinks} />
 
             {/* Nodes */}
             {devices.map((d) => {
@@ -85,7 +44,7 @@ export const MiniTopologyCard: React.FC = () => {
               return (
                 <g
                   key={`mininode-${d.id}`}
-                  className={`node ${isOnline ? '' : 'off'}`}
+                  className={`node ${isOnline || d.status === 'discovered' ? '' : 'off'}`}
                   transform={`translate(${pos.x},${pos.y})`}
                   onClick={() => openDevice(d.id)}
                 >
@@ -99,7 +58,7 @@ export const MiniTopologyCard: React.FC = () => {
                     {d.name}
                   </text>
                   <text className="meta" x="0" y="58" textAnchor="middle">
-                    {d.ip}
+                    {d.ip || 'ไม่มี IP · Config ไม่ได้'}
                   </text>
                   
                   {/* Status indicator dot */}
@@ -107,7 +66,7 @@ export const MiniTopologyCard: React.FC = () => {
                     cx="25"
                     cy="-25"
                     r="5"
-                    fill={isOnline ? 'oklch(62% 0.15 150)' : 'oklch(56% 0.19 25)'}
+                    fill={d.status === 'discovered' ? 'oklch(75% 0.16 75)' : isOnline ? 'oklch(62% 0.15 150)' : 'oklch(56% 0.19 25)'}
                     stroke="white"
                     strokeWidth="2"
                   />

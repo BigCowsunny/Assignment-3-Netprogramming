@@ -12,6 +12,7 @@ export const KpiGrid: React.FC = () => {
   let errorPorts = 0;
 
   devices.forEach((d) => {
+    if (d.discovery_only) return;
     d.ports.forEach((p) => {
       if (p.virtual) return;
       totalPorts++;

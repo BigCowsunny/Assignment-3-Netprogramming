@@ -9,6 +9,7 @@ export const DashboardDeviceTable: React.FC = () => {
   const latestTraffic = useLatestTraffic();
 
   const getPortRatio = (d: (typeof devices)[0]) => {
+    if (d.discovery_only) return `${d.ports.length} พบผ่าน CDP/LLDP`;
     const ps = d.ports.filter((p) => !p.virtual);
     const u = ps.filter((p) => p.admin === 'up' && p.oper === 'up').length;
     return `${u}/${ps.length}`;
@@ -73,13 +74,15 @@ export const DashboardDeviceTable: React.FC = () => {
                     {d.name}
                   </button>
                 </td>
-                <td className="mono">{d.ip}</td>
+                <td className="mono">{d.ip || 'ไม่มี IP'}{d.discovery_only && <div className="hint">Config ไม่ได้</div>}</td>
                 <td>{d.type === 'switch' ? 'Switch' : 'Router'}</td>
                 <td>
                   {d.status === 'online' ? (
                     <span className="pill ok">
                       <i></i>ออนไลน์
                     </span>
+                  ) : d.status === 'discovered' ? (
+                    <span className="pill warn"><i></i>พบผ่าน CDP/LLDP</span>
                   ) : (
                     <span className="pill bad">
                       <i></i>ออฟไลน์

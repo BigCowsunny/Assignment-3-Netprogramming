@@ -4,3 +4,4 @@ pysnmp>=7.1.0
 pyasn1>=0.6.0
 pydantic>=2.9.0
 websockets>=13.0
+scapy>=2.6.1,<3

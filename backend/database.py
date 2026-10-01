@@ -7,6 +7,9 @@ import sqlite3
 import json
 import time
 import os
+import hashlib
+import ipaddress
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -105,9 +108,55 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS discovered_neighbors (
+        id TEXT PRIMARY KEY,
+        identity TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        source_mac TEXT DEFAULT '',
+        management_ip TEXT DEFAULT '',
+        device_type TEXT DEFAULT 'switch',
+        platform TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        protocol TEXT DEFAULT 'CDP',
+        capture_interface TEXT DEFAULT '',
+        ports_json TEXT DEFAULT '[]',
+        last_seen REAL NOT NULL,
+        expires_at REAL NOT NULL
+    );
     """)
 
     device_columns = {row[1] for row in cursor.execute("PRAGMA table_info(devices)").fetchall()}
+    cursor.executescript("""
+    CREATE TABLE IF NOT EXISTS neighbor_aliases (
+        alias TEXT NOT NULL, device_id TEXT NOT NULL, PRIMARY KEY (alias, device_id));
+    CREATE TABLE IF NOT EXISTS topology_observations (
+        observer_id TEXT NOT NULL, protocol TEXT NOT NULL, link_key TEXT NOT NULL,
+        device_a TEXT NOT NULL, port_a TEXT NOT NULL, device_b TEXT NOT NULL, port_b TEXT NOT NULL,
+        last_seen REAL NOT NULL, expires_at REAL NOT NULL,
+        PRIMARY KEY (observer_id, protocol, link_key));
+    """)
+    neighbor_columns = {row[1] for row in cursor.execute("PRAGMA table_info(discovered_neighbors)")}
+    for column in ("device_identity", "chassis_id"):
+        if column not in neighbor_columns:
+            cursor.execute(f"ALTER TABLE discovered_neighbors ADD COLUMN {column} TEXT DEFAULT ''")
+    cursor.execute("UPDATE discovered_neighbors SET device_identity=identity WHERE device_identity=''")
+    for row in cursor.execute("SELECT * FROM discovered_neighbors").fetchall():
+        for alias in (f"ip:{row['management_ip']}" if row["management_ip"] else "",
+                      f"mac:{normalize_mac(row['source_mac'])}" if normalize_mac(row["source_mac"]) else "",
+                      f"chassis:{row['chassis_id']}" if row["chassis_id"] else ""):
+            if alias:
+                cursor.execute("INSERT OR IGNORE INTO neighbor_aliases VALUES (?,?)", (alias, row["id"]))
+    # Upgrade older permanent discovery edges to expiring observations once.
+    # Keep the data visible during migration without renewing it on each restart.
+    now = time.time()
+    for row in cursor.execute("SELECT * FROM topology_links WHERE protocol IN ('CDP','LLDP')").fetchall():
+        key = json.dumps(sorted(((row["device_a"], normalize_port_name(row["port_a"]).lower()),
+                                 (row["device_b"], normalize_port_name(row["port_b"]).lower()))))
+        cursor.execute("INSERT OR IGNORE INTO topology_observations VALUES (?,?,?,?,?,?,?,?,?)",
+                       (row["device_a"], row["protocol"], key, row["device_a"], row["port_a"],
+                        row["device_b"], row["port_b"], now, now + 180))
+        cursor.execute("DELETE FROM topology_links WHERE id=?", (row["id"],))
     if "snmp_port" not in device_columns:
         cursor.execute("ALTER TABLE devices ADD COLUMN snmp_port INTEGER DEFAULT 161")
 
@@ -272,8 +321,205 @@ def get_all_devices() -> List[Dict[str, Any]]:
         dev["type"] = dev["device_type"]
         dev["up"] = dev["up_time"] or "0 วัน 00:00:00"
         dev["descr"] = dev["sys_descr"] or ""
+        dev["discovery_only"] = False
+        dev["can_configure"] = True
+    cursor.execute("SELECT * FROM discovered_neighbors ORDER BY name")
+    observations = [dict(row) for row in cursor.fetchall()]
     conn.close()
+    for row in observations:
+        if _match_managed_neighbor(row, devices) or _match_captured_neighbor(row, observations, devices):
+            continue
+        devices.append(_neighbor_device(row))
     return devices
+
+
+def management_ip(value: str) -> str:
+    """Only usable IPv4 addresses may be passed to this app's SNMP transport."""
+    try:
+        address = ipaddress.IPv4Address(value)
+        if not (address.is_unspecified or address.is_multicast or address.is_loopback or str(address) == "255.255.255.255"):
+            return str(address)
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
+def normalize_port_name(name: str) -> str:
+    """Expand only abbreviations followed by a port number, never full names."""
+    for short, full in (("Gi", "GigabitEthernet"), ("Gig", "GigabitEthernet"),
+                        ("Fa", "FastEthernet"), ("Fas", "FastEthernet"),
+                        ("Eth", "Ethernet"), ("Et", "Ethernet"), ("Te", "TenGigabitEthernet")):
+        if re.match(rf"^{short}\s*(?=\d)", name, re.IGNORECASE):
+            return re.sub(rf"^{short}\s*", full, name, flags=re.IGNORECASE)
+    return name.strip()
+
+
+def _match_managed_neighbor(row: dict, devices: list) -> Optional[dict]:
+    managed = [device for device in devices if not device.get("discovery_only")]
+    exact = [device for device in managed if device["id"] == row["id"] or
+             (row.get("management_ip") and device["ip"] == row["management_ip"])]
+    if exact:
+        return exact[0]
+    mac = normalize_mac(row.get("source_mac", ""))
+    if mac:
+        matching = [device for device in managed if any(normalize_mac(port.get("mac", "")) == mac for port in device.get("ports", []))]
+        if len(matching) == 1:
+            return matching[0]
+    identity = (row.get("device_identity") or row["identity"]).strip().lower()
+    if identity in ("switch", "router", "device", "localhost"):
+        return None
+    named = [device for device in managed if identity in
+             {str(device.get("name", "")).lower(), str(device.get("name", "")).lower().split(".")[0]}]
+    if mac:
+        named = [device for device in named if not any(normalize_mac(p.get("mac", "")) for p in device.get("ports", []))]
+    # Do not attach a neighbor to an arbitrary device when names are ambiguous.
+    return named[0] if len(named) == 1 else None
+
+
+def _match_captured_neighbor(row: dict, observations: list, devices: list) -> Optional[dict]:
+    """Resolve a weak CDP cache ID using advertisements on the reporter's segment.
+
+    Require the reporter's exact local-port MAC in a captured advertisement,
+    then an unambiguous Device ID + remote Port ID on that same capture NIC.
+    Neither hostname alone nor a shared IP subnet establishes this relation.
+    Preserve both observations so a later ambiguity can undo the association.
+    """
+    if row.get("source_mac") or row.get("chassis_id") or row.get("management_ip"):
+        return None
+    scope = re.fullmatch(r"(switch|router|device|localhost)\|observer:([^|]+)\|local:(.+)",
+                         row["identity"], re.IGNORECASE)
+    if not scope:
+        return None
+    observer = next((device for device in devices if device["id"] == scope[2] and
+                     not device.get("discovery_only")), None)
+    if not observer:
+        return None
+    local_macs = {normalize_mac(port.get("mac", "")) for port in observer.get("ports", [])
+                  if normalize_port_name(port["name"]).lower() == normalize_port_name(scope[3]).lower()}
+    local_macs.discard("")
+    interfaces = {item["capture_interface"] for item in observations
+                  if item["capture_interface"] and normalize_mac(item["source_mac"]) in local_macs}
+    if not interfaces:
+        return None
+    remote_ports = {normalize_port_name(port).lower() for port in json.loads(row["ports_json"])}
+    candidates = [item for item in observations if normalize_mac(item["source_mac"]) and
+                  item["capture_interface"] in interfaces and
+                  (item.get("device_identity") or item["identity"]).casefold() ==
+                  (row.get("device_identity") or row["identity"]).casefold() and
+                  remote_ports & {normalize_port_name(port).lower() for port in json.loads(item["ports_json"])}]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _neighbor_device(row: dict) -> dict:
+    ip = row["management_ip"] or ""
+    reason = ("ยังไม่มี Management IP จึงไม่สามารถ Config หรืออ่าน Traffic ผ่าน SNMP ได้"
+              if not ip else f"พบ IP จาก {row['protocol']} แต่ยังไม่ได้ยืนยัน SNMP จึงยังไม่สามารถ Config ได้")
+    ports = [{"idx": 0, "name": name, "speed": 0, "admin": "unknown", "oper": "unknown",
+              "errors": 0, "mac": "", "alias": f"พอร์ตที่ประกาศผ่าน {row['protocol']}; ยังไม่ทราบสถานะ SNMP",
+              "virtual": False, "ip": "", "observed_only": True}
+             for name in json.loads(row["ports_json"])]
+    return {"id": row["id"], "name": row["name"], "ip": ip, "type": row["device_type"],
+            "vendor": row["platform"] or row["protocol"], "descr": row["description"],
+            "ver": "v2c", "community": "", "snmp_port": 161, "rw": False,
+            "status": "discovered" if row["expires_at"] > time.time() else "offline",
+            "up": "—", "ports": ports, "discovery_only": True, "can_configure": False,
+            "config_unavailable_reason": reason, "discovery_protocol": row["protocol"],
+            "discovery_identity": row.get("device_identity") or row["identity"], "source_mac": row["source_mac"],
+            "chassis_id": row.get("chassis_id", ""),
+            "capture_interface": row["capture_interface"], "last_seen": row["last_seen"]}
+
+
+def normalize_mac(value: str) -> str:
+    value = re.sub(r"[^0-9a-f]", "", str(value).lower())
+    return ":".join(value[index:index + 2] for index in range(0, 12, 2)) if len(value) == 12 else ""
+
+
+def record_discovered_neighbor(neighbor: dict) -> tuple[dict, bool]:
+    """Persist advertisements separately; never treat them as verified SNMP inventory."""
+    identity = str(neighbor.get("identity") or neighbor.get("name") or "").strip()[:512]
+    if not identity:
+        raise ValueError("Neighbor Device/Chassis ID is required")
+    protocol = str(neighbor.get("protocol", "CDP"))
+    ip = management_ip(neighbor.get("management_ip", ""))
+    mac = normalize_mac(neighbor.get("chassis_mac") or neighbor.get("source_mac", ""))
+    chassis = str(neighbor.get("chassis_id", ""))
+    aliases = [value for value in (f"ip:{ip}" if ip else "",
+               f"mac:{mac}" if mac else "", f"chassis:{chassis}" if chassis else "") if value]
+    key = (aliases[-1] if chassis else f"{protocol.lower()}:{identity.casefold()}|mac:{mac}" if mac
+           else f"ip:{ip}" if ip else identity.casefold())
+    if not aliases and identity.lower() in ("switch", "router", "device", "localhost"):
+        key += f"|observer:{neighbor.get('observer_id', '')}|local:{neighbor.get('local_port', '')}"
+    neighbor_id = "cdp_" + hashlib.sha256(key.encode()).hexdigest()[:24]
+    now = time.time()
+    ttl = max(0, min(int(neighbor.get("ttl", 180)), 65535))
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        old = cursor.execute("SELECT * FROM discovered_neighbors WHERE identity = ?", (key,)).fetchone()
+        if not old:
+            # Chassis/MAC are stronger than an address that DHCP may reuse.
+            for alias in sorted(aliases, key=lambda value: value.startswith("ip:")):
+                matches = cursor.execute(
+                    "SELECT n.* FROM discovered_neighbors n JOIN neighbor_aliases a ON a.device_id=n.id WHERE a.alias=?",
+                    (alias,)).fetchall()
+                matches = [item for item in matches if not (
+                    alias.startswith("ip:") and (
+                        (chassis and item["chassis_id"] and chassis != item["chassis_id"]) or
+                        (mac and item["source_mac"] and mac != normalize_mac(item["source_mac"]))
+                    ))]
+                if len(matches) == 1:
+                    old = matches[0]
+                    break
+        if not old:
+            candidates = cursor.execute("SELECT * FROM discovered_neighbors WHERE lower(device_identity)=?", (identity.lower(),)).fetchall()
+            candidates = [item for item in candidates if
+                          not (mac and item["source_mac"] and normalize_mac(item["source_mac"]) != mac) and
+                          not (chassis and item["chassis_id"] and item["chassis_id"] != chassis) and
+                          not (ip and item["management_ip"] and item["management_ip"] != ip)]
+            if len(candidates) == 1 and identity.lower() not in ("switch", "router", "device", "localhost"):
+                old = candidates[0]
+        if old:
+            neighbor_id, key = old["id"], old["identity"]
+        names = json.loads(old["ports_json"]) if old else []
+        port = normalize_port_name(str(neighbor.get("port") or "").strip())
+        if port and port not in names:
+            names.append(port)
+        ip = management_ip(neighbor.get("management_ip", ""))
+        cursor.execute("""
+        INSERT INTO discovered_neighbors
+        (id, identity, name, source_mac, management_ip, device_type, platform, description,
+         protocol, capture_interface, ports_json, last_seen, expires_at, device_identity, chassis_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(identity) DO UPDATE SET
+            name=excluded.name, source_mac=excluded.source_mac,
+            management_ip=excluded.management_ip, device_type=excluded.device_type,
+            platform=excluded.platform, description=excluded.description, protocol=excluded.protocol,
+            capture_interface=excluded.capture_interface, ports_json=excluded.ports_json,
+            last_seen=excluded.last_seen, expires_at=excluded.expires_at,
+            device_identity=excluded.device_identity, chassis_id=excluded.chassis_id
+        """, (neighbor_id, key, neighbor.get("name") or identity,
+              neighbor.get("source_mac") or mac or (old["source_mac"] if old else ""), ip,
+              neighbor.get("device_type", "switch"), neighbor.get("platform") or (old["platform"] if old else ""),
+              neighbor.get("description") or (old["description"] if old else ""), neighbor.get("protocol", "CDP"),
+              neighbor.get("capture_interface") or (old["capture_interface"] if old else ""),
+              json.dumps(names), now, now + ttl, identity, chassis or (old["chassis_id"] if old else "")))
+        cursor.execute("DELETE FROM neighbor_aliases WHERE device_id=? AND alias LIKE 'ip:%'", (neighbor_id,))
+        for alias in aliases:
+            cursor.execute("INSERT OR IGNORE INTO neighbor_aliases(alias,device_id) VALUES (?,?)", (alias, neighbor_id))
+        conn.commit()
+        row = dict(cursor.execute("SELECT * FROM discovered_neighbors WHERE id = ?", (neighbor_id,)).fetchone())
+    finally:
+        conn.close()
+    devices = get_all_devices()
+    managed = _match_managed_neighbor(row, devices)
+    conn = get_db()
+    try:
+        observations = [dict(item) for item in conn.execute("SELECT * FROM discovered_neighbors")]
+    finally:
+        conn.close()
+    captured = _match_captured_neighbor(row, observations, devices)
+    return (managed or (_neighbor_device(captured) if captured else
+            next(device for device in devices if device["id"] == neighbor_id))), old is None
 
 
 def get_device(dev_id: str) -> Optional[Dict[str, Any]]:
@@ -288,8 +534,12 @@ def save_device(dev: Dict[str, Any]):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT OR REPLACE INTO devices (id, name, ip, snmp_version, community, snmp_port, device_type, vendor, sys_descr, status, up_time, last_seen)
+    INSERT INTO devices (id, name, ip, snmp_version, community, snmp_port, device_type, vendor, sys_descr, status, up_time, last_seen)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(id) DO UPDATE SET name=excluded.name, ip=excluded.ip,
+    snmp_version=excluded.snmp_version, community=excluded.community, snmp_port=excluded.snmp_port,
+    device_type=excluded.device_type, vendor=excluded.vendor, sys_descr=excluded.sys_descr,
+    status=excluded.status, up_time=excluded.up_time, last_seen=excluded.last_seen
     """, (
         dev["id"], dev["name"], dev["ip"], dev.get("ver", dev.get("snmp_version", "v2c")),
         dev.get("community", "public"), dev.get("snmp_port", dev.get("port", 161)), dev.get("type", dev.get("device_type", "switch")),
@@ -298,6 +548,7 @@ def save_device(dev: Dict[str, Any]):
     ))
 
     if "ports" in dev:
+        cursor.execute("DELETE FROM interfaces WHERE device_id = ?", (dev["id"],))
         for p in dev["ports"]:
             port_id = f"{dev['id']}_{p['name']}"
             cursor.execute("""
@@ -320,6 +571,9 @@ def delete_device(dev_id: str):
     cursor.execute("DELETE FROM interfaces WHERE device_id = ?", (dev_id,))
     cursor.execute("DELETE FROM topology_links WHERE device_a = ? OR device_b = ?", (dev_id, dev_id))
     cursor.execute("DELETE FROM devices WHERE id = ?", (dev_id,))
+    cursor.execute("DELETE FROM discovered_neighbors WHERE id = ?", (dev_id,))
+    cursor.execute("DELETE FROM neighbor_aliases WHERE device_id = ?", (dev_id,))
+    cursor.execute("DELETE FROM topology_observations WHERE observer_id=? OR device_a=? OR device_b=?", (dev_id, dev_id, dev_id))
     conn.commit()
     conn.close()
 
@@ -340,6 +594,54 @@ def save_topology_link(device_a: str, port_a: str, device_b: str, port_b: str, p
     )
     conn.commit()
     conn.close()
+
+
+def replace_topology_observations(observer_id: str, protocol: str, links: list, ttl: int = 180):
+    """Replace a successful table snapshot. Do not call this after a failed walk."""
+    now = time.time()
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM topology_observations WHERE observer_id=? AND protocol=?", (observer_id, protocol))
+        conn.execute("DELETE FROM topology_links WHERE device_a=? AND protocol=?", (observer_id, protocol))
+        for link in links:
+            key = json.dumps(sorted(((link["a"], normalize_port_name(link["pa"]).lower()),
+                                     (link["b"], normalize_port_name(link["pb"]).lower()))))
+            conn.execute("INSERT INTO topology_observations VALUES (?,?,?,?,?,?,?,?,?)",
+                         (observer_id, protocol, key, link["a"], link["pa"], link["b"], link["pb"], now, now + ttl))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_topology_links() -> list:
+    conn = get_db()
+    try:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM topology_links")]
+        rows += [dict(row) for row in conn.execute("SELECT * FROM topology_observations WHERE expires_at>? ORDER BY last_seen", (time.time(),))]
+        observations = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM discovered_neighbors")}
+    finally:
+        conn.close()
+    devices = get_all_devices()
+    by_id = {device["id"]: device for device in devices}
+    def canonical_id(value):
+        if value in by_id:
+            return value
+        matched = _match_managed_neighbor(observations[value], devices) if value in observations else None
+        captured = _match_captured_neighbor(observations[value], list(observations.values()), devices) if value in observations else None
+        return matched["id"] if matched else captured["id"] if captured else value
+    links = {}
+    for row in rows:
+        a, b = canonical_id(row["device_a"]), canonical_id(row["device_b"])
+        if a not in by_id or b not in by_id or a == b:
+            continue
+        if any(by_id[value].get("discovery_only") and by_id[value]["status"] == "offline" for value in (a, b)):
+            continue
+        pa, pb = row["port_a"], row["port_b"]
+        pa = next((p["name"] for p in by_id[a]["ports"] if normalize_port_name(p["name"]).lower() == normalize_port_name(pa).lower()), pa)
+        pb = next((p["name"] for p in by_id[b]["ports"] if normalize_port_name(p["name"]).lower() == normalize_port_name(pb).lower()), pb)
+        key = tuple(sorted(((a, normalize_port_name(pa).lower()), (b, normalize_port_name(pb).lower()))))
+        links[key] = {"a": a, "pa": pa, "b": b, "pb": pb, "proto": row.get("protocol", "CDP")}
+    return list(links.values())
 
 
 def update_interface_status(device_id: str, port_name: str, admin: Optional[str] = None, oper: Optional[str] = None):

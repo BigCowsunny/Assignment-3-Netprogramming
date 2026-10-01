@@ -29,6 +29,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
   const [status, setStatus] = useState<'online' | 'offline'>('online');
 
   const [isTesting, setIsTesting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [testResult, setTestResult] = useState<{
     status: 'ok' | 'err';
     message: string;
@@ -44,7 +45,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       setVersion(device.ver);
       setCommunity(device.community || 'public');
       setSnmpPort(String(device.snmp_port || device.port || 161));
-      setStatus(device.status);
+      setStatus(device.status === 'offline' ? 'offline' : 'online');
       setTestResult(null);
     }
   }, [device, isOpen]);
@@ -86,7 +87,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const trimmedIp = ip.trim();
     
     // Skip validation for Serial devices
@@ -111,8 +112,13 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       status,
     };
 
-    updateDevice(updated);
-    onClose();
+    setIsSaving(true);
+    try {
+      if (await updateDevice(updated)) onClose();
+      else setTestResult({ status: 'err', message: 'บันทึกไม่สำเร็จ', details: 'ตรวจสอบ Management IP และ SNMP community; อุปกรณ์ยังคงสถานะเดิม' });
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -134,6 +140,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
         </div>
 
         <div className="sheet-body">
+          {device.discovery_only && <p className="hint">{device.config_unavailable_reason} · ใส่ Management IP และ community เพื่อยืนยัน SNMP ก่อนใช้งาน</p>}
           <div className="field">
             <label htmlFor="ed-name">ชื่ออุปกรณ์ (sysName)</label>
             <input
@@ -248,13 +255,13 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
           <button
             className={`btn ${isTesting ? 'spinning' : ''}`}
             onClick={handleTestConnection}
-            disabled={isTesting}
+            disabled={isTesting || isSaving}
           >
             <Icon name="i-refresh" />
             Test Connection
           </button>
-          <button className="btn btn-primary" onClick={handleSave}>
-            บันทึกการแก้ไข
+          <button className="btn btn-primary" onClick={handleSave} disabled={isSaving || isTesting}>
+            {isSaving ? 'กำลังยืนยัน SNMP…' : 'บันทึกการแก้ไข'}
           </button>
         </div>
       </div>

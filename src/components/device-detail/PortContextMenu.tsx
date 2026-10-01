@@ -2,6 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { Device, Port } from '../../types/snmp';
 import { Icon } from '../common/Icons';
 import { fmtSpeed } from '../../utils/formatters';
+import { configurationWarning } from '../../utils/deviceManagement';
 
 interface PortContextMenuProps {
   device: Device;
@@ -24,6 +25,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const isUp = port.admin === 'up';
+  const warning = configurationWarning(device);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -59,12 +61,13 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
       <div className="pm-head">
         <b>{port.name}</b>
         <div className="hint">
-          {fmtSpeed(port.speed)} · ifIndex {port.idx} ·{' '}
-          ทดลอง SET และตรวจค่าจากอุปกรณ์
+          {warning || `${fmtSpeed(port.speed)} · ifIndex ${port.idx} · ทดลอง SET และตรวจค่าจากอุปกรณ์`}
         </div>
       </div>
 
       <button
+        disabled={!!warning}
+        title={warning}
         onClick={() => {
           onClose();
           onViewTraffic();
@@ -77,6 +80,8 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
       {isUp ? (
         <button
           className="danger"
+          disabled={!!warning}
+          title={warning}
           onClick={() => {
             onClose();
             onToggleAdmin(true);
@@ -87,6 +92,8 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
         </button>
       ) : (
         <button
+          disabled={!!warning}
+          title={warning}
           onClick={() => {
             onClose();
             onToggleAdmin(false);

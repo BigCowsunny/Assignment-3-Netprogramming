@@ -1,7 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
-import { shortN } from '../../utils/formatters';
+import { TopologyConnections } from './TopologyConnections';
 
 export const TopologyView: React.FC = () => {
   const {
@@ -12,6 +12,7 @@ export const TopologyView: React.FC = () => {
     setTopologyZoom,
     updateTopologyPos,
     runDiscovery,
+    discoveryProgress,
     openDevice,
   } = useSnmp();
 
@@ -22,9 +23,8 @@ export const TopologyView: React.FC = () => {
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [isDiscovering, setIsDiscovering] = useState(false);
-  const [discoverProgress, setDiscoverProgress] = useState(0);
-  const [network, setNetwork] = useState('192.168.1.0/24');
-  const [communities, setCommunities] = useState('public,private');
+  const [network, setNetwork] = useState('');
+  const [communities, setCommunities] = useState('');
 
   const [dragState, setDragState] = useState<{
     nodeId: string;
@@ -35,12 +35,8 @@ export const TopologyView: React.FC = () => {
 
   const handleDiscover = async () => {
     setIsDiscovering(true);
-    setDiscoverProgress(0);
-    setDiscoverProgress(35);
     await runDiscovery({ network, communities });
-    setDiscoverProgress(100);
     setIsDiscovering(false);
-    setTimeout(() => setDiscoverProgress(0), 500);
   };
 
   const getSvgCoordinates = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -111,22 +107,22 @@ export const TopologyView: React.FC = () => {
       <div className="page-head">
         <div>
           <h1>โทโพโลยี</h1>
-          <p>ค้นหาอุปกรณ์จริงและ EVE-NG node ด้วย SNMP</p>
+          <p>ค้นหาและไล่เพื่อนบ้านผ่าน CDP/LLDP และ SNMP</p>
         </div>
 
         <div className="hero-stats">
           {isDiscovering && (
             <div className="prog">
-              <i style={{ width: `${discoverProgress}%` }}></i>
+              <i style={{ width: `${discoveryProgress ? Math.round(100 * discoveryProgress.checked / Math.max(1, discoveryProgress.checked + discoveryProgress.queued)) : 0}%` }}></i>
             </div>
           )}
           <div className="toolbar" style={{ marginBottom: 0 }}>
-            <input aria-label="Subnet ที่ต้องการสแกน" value={network} onChange={(e) => setNetwork(e.target.value)} placeholder="192.168.1.0/24" disabled={isDiscovering} />
+            <input aria-label="IP เริ่มต้น หรือ subnet (ไม่บังคับ)" value={network} onChange={(e) => setNetwork(e.target.value)} placeholder="IP / subnet · ว่าง = อุปกรณ์ที่พบแล้ว" disabled={isDiscovering} />
             <input aria-label="SNMP communities" value={communities} onChange={(e) => setCommunities(e.target.value)} placeholder="SNMP communities คั่นด้วย comma" disabled={isDiscovering} />
             <button
               className="btn btn-primary"
               onClick={handleDiscover}
-              disabled={isDiscovering || !network.trim()}
+              disabled={isDiscovering}
             >
               <Icon name="i-radar" />
               Discover
@@ -135,6 +131,15 @@ export const TopologyView: React.FC = () => {
         </div>
       </div>
 
+      <p className="hint" role="status">
+        {!discoveryProgress ? 'ไม่ต้องระบุ subnet · ใช้ IP ที่พบผ่าน CDP/LLDP หรืออุปกรณ์ที่เพิ่มไว้ และ SNMP community ที่บันทึกไว้' :
+          `${({ starting: 'เริ่มค้นหา', scanning: 'สแกน subnet', probing: 'ตรวจ SNMP', reading_interfaces: 'อ่านพอร์ต', reading_neighbors: 'อ่านเพื่อนบ้าน', completed: 'ค้นหาเสร็จแล้ว', failed: 'ค้นหาล้มเหลว', cancelled: 'ยกเลิกแล้ว' } as Record<string, string>)[discoveryProgress.phase] || discoveryProgress.phase} ${discoveryProgress.current_name || discoveryProgress.current_ip} · ตรวจแล้ว ${discoveryProgress.checked} · พบ ${discoveryProgress.devices_count} nodes / ${discoveryProgress.links_count} neighbor links`}
+      </p>
+      {discoveryProgress?.error && <p className="hint" role="alert">{discoveryProgress.error}</p>}
+      {!!discoveryProgress?.issues?.length && <details className="hint" open={discoveryProgress.status !== 'running'}>
+        <summary>ข้อจำกัดที่พบ ({discoveryProgress.issues.length})</summary>
+        <ul>{discoveryProgress.issues.map((issue, index) => <li key={index}>{issue.name || issue.ip || 'Discovery'}: {issue.message}</li>)}</ul>
+      </details>}
       <div className="topo-wrap">
         <svg
           id="topo"
@@ -148,49 +153,8 @@ export const TopologyView: React.FC = () => {
           onPointerUp={handlePointerUp}
         >
           <g className="topo-layer" transform={transformStyle}>
-            {/* Links */}
-            {topologyLinks.map((l, i) => {
-              const A = devices.find((d) => d.id === l.a);
-              const B = devices.find((d) => d.id === l.b);
-              const posA = topologyPos[l.a];
-              const posB = topologyPos[l.b];
-              if (!A || !B || !posA || !posB) return null;
-
-              const pa = A.ports.find((p) => p.name === l.pa);
-              const pb = B.ports.find((p) => p.name === l.pb);
-              const isUp =
-                pa?.oper === 'up' &&
-                pb?.oper === 'up' &&
-                A.status === 'online' &&
-                B.status === 'online';
-
-              const mx = (posA.x + posB.x) / 2;
-              const my = (posA.y + posB.y) / 2;
-
-              return (
-                <g key={`topolink-${i}`}>
-                  <line
-                    className={`link ${isUp ? 'up' : 'down'}`}
-                    x1={posA.x}
-                    y1={posA.y}
-                    x2={posB.x}
-                    y2={posB.y}
-                  />
-                  <g className="link-label">
-                    <rect
-                      x={mx - 52}
-                      y={my - 9}
-                      width={104}
-                      height={18}
-                      rx={4}
-                    />
-                    <text x={mx} y={my + 4}>
-                      {shortN(l.pa)} ↔ {shortN(l.pb)}
-                    </text>
-                  </g>
-                </g>
-              );
-            })}
+            {/* Port pairs are deduplicated; shared media use one segment. */}
+            <TopologyConnections devices={devices} positions={topologyPos} links={topologyLinks} />
 
             {/* Nodes */}
             {devices.map((d) => {
@@ -201,7 +165,7 @@ export const TopologyView: React.FC = () => {
               return (
                 <g
                   key={`toponode-${d.id}`}
-                  className={`node ${isOnline ? '' : 'off'}`}
+                  className={`node ${isOnline || d.status === 'discovered' ? '' : 'off'}`}
                   transform={`translate(${pos.x},${pos.y})`}
                   onPointerDown={(e) => handlePointerDown(e, d.id)}
                 >
@@ -215,7 +179,7 @@ export const TopologyView: React.FC = () => {
                     {d.name}
                   </text>
                   <text className="meta" x="0" y="58" textAnchor="middle">
-                    {d.ip}
+                    {d.ip || 'ไม่มี IP · Config ไม่ได้'}
                   </text>
                   
                   {/* Status indicator dot */}
@@ -223,7 +187,7 @@ export const TopologyView: React.FC = () => {
                     cx="25"
                     cy="-25"
                     r="5"
-                    fill={isOnline ? 'oklch(62% 0.15 150)' : 'oklch(56% 0.19 25)'}
+                    fill={d.status === 'discovered' ? 'oklch(75% 0.16 75)' : isOnline ? 'oklch(62% 0.15 150)' : 'oklch(56% 0.19 25)'}
                     stroke="white"
                     strokeWidth="2"
                   />
@@ -244,7 +208,7 @@ export const TopologyView: React.FC = () => {
       </div>
 
       <p className="hint mt12">
-        เส้นเขียว = link up · เส้นแดง = link down (อัปเดตทันทีเมื่อได้รับ Trap) · ป้ายแสดง Port ปลายทางทั้งสองฝั่ง
+        เส้นเขียว = link up · เส้นประ = พบผ่าน CDP/LLDP ยังไม่ทราบสถานะ · เส้นแดง = link down (อัปเดตทันทีเมื่อได้รับ Trap) · ป้ายแสดง Port · จุดเครือข่ายร่วมรวม neighbor บนพอร์ตเดียวกัน
       </p>
     </section>
   );

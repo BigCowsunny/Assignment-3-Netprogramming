@@ -4,7 +4,7 @@ import { Icon } from '../common/Icons';
 import { pad } from '../../utils/formatters';
 
 export const Topbar: React.FC = () => {
-  const { searchQuery, setSearchQuery, setView } = useSnmp();
+  const { searchQuery, setSearchQuery, setView, isBackendConnected } = useSnmp();
   const [time, setTime] = useState<string>('00:00:00');
 
   useEffect(() => {
@@ -32,7 +32,7 @@ export const Topbar: React.FC = () => {
         SNMP Network Monitor <small>v1.0</small>
       </div>
 
-      <span className="demo-badge">โหมดสาธิต · ข้อมูลจำลอง</span>
+      <span className="demo-badge">{isBackendConnected ? 'ข้อมูลจาก Backend · SNMP/CDP/LLDP' : 'Backend ยังไม่เชื่อมต่อ'}</span>
 
       <div className="spacer"></div>
 

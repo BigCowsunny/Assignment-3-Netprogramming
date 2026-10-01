@@ -11,7 +11,8 @@ import {
   TrapEvent,
   ViewName,
 } from '../types/snmp';
-import { scanNetwork } from '../services/networkDiscovery';
+import { runDiscoveryApi, DiscoveryProgress } from '../services/api';
+import { configurationWarning, escapeHtml, mergeDevices } from '../utils/deviceManagement';
 import {
   checkBackendHealth,
   fetchDevicesApi,
@@ -39,6 +40,7 @@ interface SnmpContextType {
   showVirtual: boolean;
   isRealtime: boolean;
   discoveryFound: boolean;
+  discoveryProgress: DiscoveryProgress | null;
   topologyZoom: number;
   topologyPos: Record<string, TopologyNodePos>;
   topologyLinks: TopologyLink[];
@@ -64,7 +66,7 @@ interface SnmpContextType {
   setFilterType: (t: string) => void;
   setFilterStatus: (s: string) => void;
   addDevice: (device: Device) => void;
-  updateDevice: (device: Device) => void;
+  updateDevice: (device: Device) => Promise<boolean>;
   deleteDevice: (deviceId: string) => void;
   setPortAdmin: (deviceId: string, portName: string, turnDown: boolean) => void;
   addToast: (kind: 'ok' | 'bad' | '', title: string, body?: string) => void;
@@ -104,6 +106,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       return false;
     }
   });
+  const [discoveryProgress, setDiscoveryProgress] = useState<DiscoveryProgress | null>(null);
 
   const [topologyZoom, setTopologyZoom] = useState<number>(1);
   const [topologyPos, setTopologyPos] = useState<Record<string, TopologyNodePos>>(() => {
@@ -241,6 +244,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const openTraffic = (deviceId: string, portName: string) => {
+    const device = devices.find((item) => item.id === deviceId);
+    if (device && configurationWarning(device)) {
+      addToast('bad', 'ยังไม่สามารถอ่าน Traffic ได้', configurationWarning(device));
+      return;
+    }
     setSelectedDeviceId(deviceId);
     setSelectedPortName(portName);
     setTimeRange('day');
@@ -250,7 +258,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const addDevice = (newDevice: Device) => {
     console.log('🆕 Adding device:', newDevice.id, newDevice.name);
-    setDevices((prev) => [...prev, newDevice]);
+    setDevices((prev) => mergeDevices(prev, [newDevice]));
     
     // Auto add to topology
     setTopologyPos((prev) => {
@@ -278,9 +286,9 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     
     addAuditLog('เพิ่มอุปกรณ์', newDevice.ip, 'สำเร็จ');
     addToast(
-      'ok',
-      'เพิ่มอุปกรณ์แล้ว',
-      `${newDevice.name} · ดึงข้อมูล interface ครบ ${newDevice.ports.filter((p) => !p.virtual).length} ports`
+      newDevice.discovery_only ? 'bad' : 'ok',
+      newDevice.discovery_only ? 'พบอุปกรณ์จาก CDP' : 'เพิ่มอุปกรณ์แล้ว',
+      newDevice.discovery_only ? `${newDevice.name} · ${configurationWarning(newDevice)}` : `${newDevice.name} · ดึงข้อมูล interface ครบ ${newDevice.ports.filter((p) => !p.virtual).length} ports`
     );
     setSelectedDeviceId(newDevice.id);
     setSelectedPortName(null);
@@ -302,8 +310,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setDevices((prev) => prev.map((d) => (d.id === updatedDevice.id ? saved as Device : d)));
       addAuditLog(`แก้ไขอุปกรณ์ ${updatedDevice.name}`, updatedDevice.ip, 'สำเร็จ');
       addToast('ok', 'แก้ไขอุปกรณ์แล้ว', `${updatedDevice.name} (${updatedDevice.ip})`);
+      return true;
     } catch (error) {
       addToast('bad', 'แก้ไขอุปกรณ์ไม่สำเร็จ', error instanceof Error ? error.message : String(error));
+      return false;
     }
   };
 
@@ -313,7 +323,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     openConfirm({
       title: 'ยืนยันการลบอุปกรณ์',
-      body: `ลบ <b>${target.name}</b> <span class="mono">${target.ip}</span> ออกจากตาราง monitor?<br><span class="hint">ข้อมูลทราฟฟิกย้อนหลังของอุปกรณ์นี้จะถูกลบด้วย</span>`,
+      body: `ลบ <b>${escapeHtml(target.name)}</b> <span class="mono">${escapeHtml(target.ip || 'ไม่มี IP')}</span> ออกจากตาราง monitor?<br><span class="hint">ข้อมูลทราฟฟิกย้อนหลังของอุปกรณ์นี้จะถูกลบด้วย</span>`,
       okText: 'ลบอุปกรณ์',
       danger: true,
       onConfirm: async () => {
@@ -352,6 +362,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if (!dev) return;
     const port = dev.ports.find((p) => p.name === portName);
     if (!port) return;
+    if (configurationWarning(dev)) {
+      addToast('bad', 'ไม่สามารถ Config ได้', configurationWarning(dev));
+      return;
+    }
     if (dev.ip === 'Serial (COM)') {
       addToast(
         'bad',
@@ -365,7 +379,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     openConfirm({
       title: turnDown ? 'ยืนยันการปิดพอร์ต' : 'ยืนยันการเปิดพอร์ต',
-      body: `อุปกรณ์ <b>${dev.name}</b> <span class="mono">${dev.ip}</span><br>พอร์ต <b class="mono">${port.name}</b> · ifAdminStatus.${port.idx} → ${turnDown ? '2 (down)' : '1 (up)'}${
+      body: `อุปกรณ์ <b>${escapeHtml(dev.name)}</b> <span class="mono">${escapeHtml(dev.ip)}</span><br>พอร์ต <b class="mono">${escapeHtml(port.name)}</b> · ifAdminStatus.${port.idx} → ${turnDown ? '2 (down)' : '1 (up)'}${
         isUplink
           ? '<br><br><span class="hint">หมายเหตุ: พอร์ตนี้เป็น Uplink — ถ้าปิด การเชื่อมต่อชั้นเหนือขึ้นไปจะขาดทันที</span>'
           : ''
@@ -419,20 +433,20 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const runDiscovery = async (options: { network?: string; communities?: string } = {}): Promise<void> => {
+    setDiscoveryProgress({ id: '', status: 'running', phase: 'starting', current_ip: '',
+      current_name: '', checked: 0, queued: 0, devices_count: devices.length,
+      links_count: topologyLinks.length, issues: [] });
     try {
-      const found = await scanNetwork(
-        options.network?.trim() || '192.168.1.0/24',
-        (options.communities || 'public').split(',').map((value) => value.trim()).filter(Boolean),
+      const result = await runDiscoveryApi(
+        options.network?.trim() || '',
+        (options.communities || '').split(',').map((value) => value.trim()).filter(Boolean),
+        setDiscoveryProgress,
       );
 
-      const normalized = found as Device[];
-      const knownIps = new Set(devices.map((device) => device.ip));
-      const added = normalized.filter((device) => !knownIps.has(device.ip));
-      setDevices((prev) => {
-        const byIp = new Map(prev.map((device) => [device.ip, device]));
-        for (const device of normalized) byIp.set(device.ip, device);
-        return [...byIp.values()];
-      });
+      const normalized = result.devices;
+      const knownIds = new Set(devices.map((device) => device.id));
+      const added = normalized.filter((device) => !knownIds.has(device.id));
+      setDevices((prev) => mergeDevices(prev.filter((device) => device.ip === 'Serial (COM)'), normalized));
       setTopologyPos((prev) => {
         const next = { ...prev };
         added.forEach((device, index) => {
@@ -442,11 +456,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         return next;
       });
       setDiscoveryFound(true);
-      const topology = await fetchTopologyApi().catch(() => null);
-      if (topology) setTopologyLinks(topology.links || []);
+      setTopologyLinks(result.links || []);
       addAuditLog('Auto Discovery (SNMP)', options.network || '', 'สำเร็จ');
       addToast('ok', 'Discovery เสร็จสิ้น', `พบ ${normalized.length} อุปกรณ์ · เพิ่มใหม่ ${added.length} อุปกรณ์`);
     } catch (error) {
+      setDiscoveryProgress((previous) => previous ? { ...previous, status: 'failed', phase: 'failed', error: error instanceof Error ? error.message : String(error) } : null);
       addAuditLog('Auto Discovery (SNMP)', options.network || '', 'ล้มเหลว');
       addToast('bad', 'Discovery ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และข้อมูลการเชื่อมต่อ');
     }
@@ -486,6 +500,17 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       setDevices(freshDevices);
       addToast('', 'รีเฟรชแล้ว', 'อ่านสถานะและ interface ล่าสุดจาก Backend/SNMP');
     }).catch((error) => addToast('bad', 'รีเฟรชไม่สำเร็จ', error instanceof Error ? error.message : String(error)));
+    void fetchTopologyApi().then((topology) => {
+      setTopologyLinks(topology.links || []);
+      setTopologyPos((saved) => {
+        const next = { ...saved };
+        (topology.devices as Device[]).forEach((device, index) => {
+          if (!next[device.id]) next[device.id] = { x: 150 + (index % 4) * 190, y: 100 + (Math.floor(index / 4) % 3) * 130 };
+        });
+        try { localStorage.setItem('od-topo', JSON.stringify(next)); } catch {}
+        return next;
+      });
+    }).catch(() => {});
   };
 
   // Poller countdown ticker
@@ -500,6 +525,26 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Keep passive discovery/TTL and backend inventory visible even after a missed WS message.
+  useEffect(() => {
+    if (!isBackendConnected) return;
+    const timer = window.setInterval(() => {
+      void fetchTopologyApi().then((topology: { devices: Device[]; links: TopologyLink[] }) => {
+        const fresh = topology.devices;
+        setTopologyLinks(topology.links);
+        setDevices((previous) => mergeDevices(previous.filter((device) => device.ip === 'Serial (COM)'), fresh));
+        setTopologyPos((saved) => {
+          const next = { ...saved };
+          fresh.forEach((device, index) => {
+            if (!next[device.id]) next[device.id] = { x: 150 + (index % 4) * 190, y: 100 + (Math.floor(index / 4) % 3) * 130 };
+          });
+          return next;
+        });
+      }).catch(() => {});
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [isBackendConnected]);
 
   // Receive only actual backend trap/status events over the WebSocket.
   useEffect(() => {
@@ -522,11 +567,9 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         }));
       } else if (message.type === 'DEVICE_STATUS_CHANGE') {
         setDevices((prev) => prev.map((device) => device.id === message.device_id ? { ...device, status: message.status, up: message.uptime || device.up } : device));
-      } else if (message.type === 'DEVICE_DISCOVERED' && message.device) {
+      } else if ((message.type === 'DEVICE_DISCOVERED' || message.type === 'NEIGHBOR_DISCOVERED') && message.device) {
         const discovered = message.device as Device;
-        setDevices((prev) => prev.some((device) => device.ip === discovered.ip)
-          ? prev.map((device) => device.ip === discovered.ip ? discovered : device)
-          : [...prev, discovered]);
+        setDevices((prev) => mergeDevices(prev, [discovered]));
         setTopologyPos((prev) => {
           if (prev[discovered.id]) return prev;
           const index = Object.keys(prev).length;
@@ -534,8 +577,12 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           try { localStorage.setItem('od-topo', JSON.stringify(next)); } catch {}
           return next;
         });
-        addAuditLog('Auto Discovery via SNMP Trap', discovered.ip, 'สำเร็จ');
-        addToast('ok', 'พบอุปกรณ์จาก SNMP Trap', `${discovered.name} · ${discovered.ip} · ${discovered.ports.length} interfaces`);
+        if (message.type === 'NEIGHBOR_DISCOVERED') {
+          if (message.is_new) addToast(discovered.discovery_only ? 'bad' : 'ok', `พบอุปกรณ์จาก ${discovered.discovery_protocol || 'CDP/LLDP'}`, `${discovered.name} · ${configurationWarning(discovered) || discovered.ip}`);
+        } else {
+          addAuditLog('Auto Discovery via SNMP Trap', discovered.ip, 'สำเร็จ');
+          addToast('ok', 'พบอุปกรณ์จาก SNMP Trap', `${discovered.name} · ${discovered.ip} · ${discovered.ports.length} interfaces`);
+        }
       }
     });
     return () => socket?.close();
@@ -562,6 +609,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         showVirtual,
         isRealtime,
         discoveryFound,
+        discoveryProgress,
         topologyZoom,
         topologyPos,
         topologyLinks,

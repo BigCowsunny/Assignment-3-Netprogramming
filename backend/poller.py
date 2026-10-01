@@ -26,6 +26,8 @@ _prev_counters: Dict[Tuple[str, int], Tuple[float, int, int]] = {}
 
 
 async def poll_device_metrics(device: dict):
+    if device.get("discovery_only") or not device.get("ip"):
+        return
     dev_id = device["id"]
     ip = device["ip"]
     community = device.get("community", "public")
@@ -46,7 +48,9 @@ async def poll_device_metrics(device: dict):
                 device["name"] = sys_info["name"]
             if sys_info.get("descr"):
                 device["descr"] = sys_info["descr"]
-        save_device(device)
+        # A liveness response must not overwrite interface state received via Trap.
+        metadata = {key: value for key, value in device.items() if key != "ports"}
+        save_device(metadata)
 
         if status_changed:
             await ws_manager.broadcast({

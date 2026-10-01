@@ -399,6 +399,7 @@ button, input, select {
 }
 
 .btn-primary:hover {
+  background: var(--accent-strong);
   filter: brightness(1.12);
 }
 
@@ -1271,6 +1272,11 @@ button, input, select {
   stroke: oklch(56% 0.19 25);
 }
 
+.link.unknown {
+  stroke: var(--muted-2);
+  stroke-dasharray: 5 4;
+}
+
 .link-label rect {
   fill: var(--surface);
   stroke: var(--border);
@@ -1281,6 +1287,26 @@ button, input, select {
   font: 500 10px var(--font-mono);
   fill: var(--muted-2);
   text-anchor: middle;
+}
+
+.shared-segment rect {
+  fill: var(--surface);
+  stroke: var(--muted);
+  stroke-width: 1.3;
+  stroke-dasharray: 3 2;
+}
+
+.shared-segment text {
+  text-anchor: middle;
+  fill: var(--muted-2);
+}
+
+.shared-segment .segment-name {
+  font: 600 12px var(--font-body);
+}
+
+.shared-segment .segment-meta {
+  font: 500 10px var(--font-body);
 }
 
 .topo-ctl {

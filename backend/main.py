@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import database
 from database import (
@@ -33,8 +33,8 @@ from database import (
 from snmp_engine import snmp_get_system_info, snmp_set_admin_status, snmp_walk_interfaces
 from trap_receiver import start_trap_listener, ws_manager
 from poller import run_poller_loop
-from discovery import discover_network, discover_topology_links
-from network_scanner import scan_network
+from cdp_receiver import cdp_capture
+from discovery_jobs import discovery_jobs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -42,14 +42,16 @@ logger = logging.getLogger("main")
 # Background tasks
 _trap_transport = None
 _poller_task = None
+_topology_task = None
 _trap_port: Optional[int] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _trap_transport, _poller_task, _trap_port
+    global _trap_transport, _poller_task, _trap_port, _topology_task
     logger.info("Initializing SQLite database...")
     init_db()
+    await cdp_capture.start()
 
     logger.info("Starting SNMP Trap Receiver on UDP 162...")
     _trap_transport = await start_trap_listener(port=162)
@@ -58,10 +60,16 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting Background SNMP Poller...")
     _poller_task = asyncio.create_task(run_poller_loop(poll_interval_seconds=60))
+    _topology_task = asyncio.create_task(discovery_jobs.periodic())
 
     yield
 
     logger.info("Shutting down background services...")
+    await cdp_capture.stop()
+    if _topology_task:
+        _topology_task.cancel()
+        await asyncio.gather(_topology_task, return_exceptions=True)
+    await discovery_jobs.stop()
     if _trap_transport:
         _trap_transport.close()
     if _poller_task:
@@ -112,8 +120,11 @@ class InterfaceAdminRequest(BaseModel):
 
 class DiscoveryRequest(BaseModel):
     seed_ip: Optional[str] = ""
-    community: str = "public"
+    community: str = ""
     subnet: Optional[str] = ""
+    communities: List[str] = Field(default_factory=list, max_length=8)
+    max_devices: int = Field(default=64, ge=1, le=256)
+    max_depth: int = Field(default=8, ge=0, le=16)
 
 
 # ------------------ REST ENDPOINTS ------------------ #
@@ -125,8 +136,20 @@ async def health_check():
         "service": "SNMP Network Monitor Backend",
         "trap_port": _trap_port,
         "poller": "active",
+        "cdp": cdp_capture.health(),
         "timestamp": time.time()
     }
+
+
+@app.get("/api/discovery/cdp/status")
+async def cdp_discovery_status():
+    return cdp_capture.health()
+
+
+@app.post("/api/discovery/cdp/start")
+async def start_cdp_discovery():
+    await cdp_capture.start()
+    return cdp_capture.health()
 
 
 @app.get("/api/devices")
@@ -141,6 +164,8 @@ async def test_device_connection(req: DeviceCreateRequest):
     FR-1.2: Test Connection via SNMP GET sysDescr
     Returns success with sysDescr or clear timeout message
     """
+    if not database.management_ip(req.ip):
+        raise HTTPException(status_code=422, detail="กรุณาระบุ Management IP ที่ใช้งานได้ก่อนเชื่อมต่อ SNMP")
     res = await snmp_get_system_info(req.ip, req.community, req.port, timeout=2.0)
     if not res.get("ok"):
         return {
@@ -160,8 +185,10 @@ async def test_device_connection(req: DeviceCreateRequest):
 @app.post("/api/devices")
 async def create_device(req: DeviceCreateRequest):
     """FR-1.1, FR-1.3: Add device, probe interfaces, and save to DB"""
+    if not database.management_ip(req.ip):
+        raise HTTPException(status_code=422, detail="กรุณาระบุ Management IP ที่ใช้งานได้ก่อนเชื่อมต่อ SNMP")
     existing = get_device(req.ip)
-    if existing:
+    if existing and not existing.get("discovery_only"):
         raise HTTPException(status_code=409, detail=f"อุปกรณ์ IP {req.ip} ถูกเพิ่มไว้แล้ว")
 
     probe = await snmp_get_system_info(req.ip, req.community, req.port, timeout=2.5)
@@ -173,7 +200,7 @@ async def create_device(req: DeviceCreateRequest):
     if not ports:
         raise HTTPException(status_code=422, detail=f"SNMP ตอบกลับที่ {req.ip}:{req.port} แต่ดึง interface ไม่ได้ ตรวจสอบสิทธิ์ community และ IF-MIB")
 
-    dev_id = f"d_{int(time.time()*1000)}"
+    dev_id = existing["id"] if existing else f"d_{int(time.time()*1000)}"
     dev_name = req.name or probe.get("name") or f"Device-{req.ip}"
     vendor = "Cisco Device (SNMP)"
     if "c2960" in probe.get("descr", "").lower():
@@ -200,7 +227,7 @@ async def create_device(req: DeviceCreateRequest):
 
     save_device(new_device)
     add_audit_log("admin", "เพิ่มอุปกรณ์", req.ip, "สำเร็จ")
-    return new_device
+    return get_device(dev_id)
 
 
 @app.get("/api/devices/{device_id}")
@@ -217,6 +244,11 @@ async def update_single_device(device_id: str, req: DeviceUpdateRequest):
     dev = get_device(device_id)
     if not dev:
         raise HTTPException(status_code=404, detail="Device not found")
+    if not database.management_ip(req.ip):
+        raise HTTPException(status_code=422, detail="กรุณาระบุ Management IP ที่ใช้งานได้ก่อนเชื่อมต่อ SNMP")
+    existing = get_device(req.ip)
+    if existing and existing["id"] != device_id and not existing.get("discovery_only"):
+        raise HTTPException(status_code=409, detail="Management IP นี้ถูกใช้กับอุปกรณ์อื่นแล้ว")
 
     probe = await snmp_get_system_info(req.ip, req.community, req.port, timeout=2.5)
     if not probe.get("ok"):
@@ -234,14 +266,14 @@ async def update_single_device(device_id: str, req: DeviceUpdateRequest):
     dev["device_type"] = req.device_type
     dev["type"] = req.device_type
     dev["vendor"] = req.vendor or dev["vendor"]
-    dev["status"] = req.status or dev["status"]
+    dev["status"] = "online"
     dev["ports"] = ports
     dev["up"] = probe.get("uptime", dev.get("up", ""))
     dev["descr"] = probe.get("descr", dev.get("descr", ""))
 
     save_device(dev)
     add_audit_log("admin", f"แก้ไขอุปกรณ์ {req.name}", req.ip, "สำเร็จ")
-    return dev
+    return get_device(device_id)
 
 
 @app.delete("/api/devices/{device_id}")
@@ -265,7 +297,7 @@ async def get_device_interfaces(device_id: str):
     return dev.get("ports", [])
 
 
-@app.post("/api/interfaces/{device_id}/{port_name}/admin-status")
+@app.post("/api/interfaces/{device_id}/{port_name:path}/admin-status")
 async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAdminRequest):
     """
     FR-3.1, FR-3.2, FR-3.4:
@@ -275,6 +307,9 @@ async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAd
     dev = get_device(device_id)
     if not dev:
         raise HTTPException(status_code=404, detail="Device not found")
+
+    if dev.get("discovery_only") or not database.management_ip(dev.get("ip", "")):
+        raise HTTPException(status_code=409, detail=dev.get("config_unavailable_reason") or "ไม่มี Management IP จึงไม่สามารถ Config ผ่าน SNMP ได้")
 
     port = next((p for p in dev.get("ports", []) if p["name"] == port_name), None)
     if not port:
@@ -323,9 +358,14 @@ async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAd
     }
 
 
-@app.get("/api/interfaces/{device_id}/{port_name}/traffic")
+@app.get("/api/interfaces/{device_id}/{port_name:path}/traffic")
 async def get_port_traffic(device_id: str, port_name: str, range: str = Query("day")):
     """FR-4.1, FR-4.2: Traffic Graph series (live, day, week, month, year)"""
+    dev = get_device(device_id)
+    if not dev:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if dev.get("discovery_only"):
+        raise HTTPException(status_code=409, detail=dev["config_unavailable_reason"])
     return get_traffic_history(device_id, port_name, range)
 
 
@@ -392,22 +432,44 @@ async def list_audit_logs():
 async def get_topology():
     """FR-6.4, FR-6.5: Topology Nodes & Links"""
     devices = get_all_devices()
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM topology_links")
-    links = [
-        {"a": r["device_a"], "pa": r["port_a"], "b": r["device_b"], "pb": r["port_b"], "proto": r["protocol"]}
-        for r in cursor.fetchall()
-    ]
-    conn.close()
+    links = database.get_topology_links()
     return {"devices": devices, "links": links}
 
 
 @app.post("/api/discovery")
 async def run_discovery_endpoint(req: DiscoveryRequest):
     """FR-6.1, FR-6.2: Auto Discovery via LLDP/CDP"""
-    res = await discover_network(req.seed_ip or "", req.community, req.subnet or "")
-    return res
+    try:
+        job = await discovery_jobs.start({**req.model_dump(), "seed_ip": req.seed_ip or "", "subnet": req.subnet or ""})
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    # Compatibility endpoint waits for the job; the frontend uses the nonblocking job endpoint.
+    while discovery_jobs.get(job["id"])["status"] == "running":
+        await asyncio.sleep(0.1)
+    finished = discovery_jobs.get(job["id"])
+    if finished["status"] != "completed":
+        raise HTTPException(status_code=500, detail="Discovery ล้มเหลว")
+    return finished["result"]
+
+
+@app.post("/api/discovery/jobs")
+async def start_discovery_job(req: DiscoveryRequest):
+    try:
+        return await discovery_jobs.start({**req.model_dump(), "seed_ip": req.seed_ip or "", "subnet": req.subnet or ""})
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@app.get("/api/discovery/jobs/{job_id}")
+async def discovery_job_status(job_id: str):
+    job = discovery_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Discovery job not found")
+    return job
 
 
 class NetworkScanRequest(BaseModel):
@@ -416,61 +478,12 @@ class NetworkScanRequest(BaseModel):
     max_concurrent: int = 50
 
 
-def _scanned_device_record(device: Dict[str, Any], index: int) -> Dict[str, Any]:
-    """Normalize scanner results to the database's device shape."""
-    ip = str(device.get("ip", "")).strip()
-    name = str(device.get("name") or f"Device-{ip}")
-    descr = str(device.get("descr") or "")
-    device_type = str(device.get("type") or "router").lower()
-    if device_type not in ("router", "switch"):
-        device_type = "router"
-    # Stable IDs prevent every scan from creating a duplicate device.
-    safe_ip = "".join(ch if ch.isalnum() else "_" for ch in ip)
-    device_id = f"scan_{safe_ip}"[:80] or f"scan_{index}"
-    return {
-        "id": device_id,
-        "name": name,
-        "ip": ip,
-        "ver": "v2c",
-        "community": device.get("community", "public"),
-        "snmp_port": int(device.get("snmp_port", 161) or 161),
-        "type": device_type,
-        "vendor": device.get("vendor") or descr[:48] or "Network device",
-        "descr": descr,
-        "status": device.get("status", "online"),
-        "up": device.get("up", "0 วัน 00:00:00"),
-        "ports": device.get("ports", []),
-    }
-
 
 @app.post("/api/network/scan")
 async def network_scan_endpoint(req: NetworkScanRequest):
     """Discover devices by SNMP GET and IF-MIB walk only."""
     logger.info(f"Network scan request: {req.network}")
-    try:
-        scanned = await scan_network(req.network, req.communities, req.max_concurrent)
-        existing_by_ip = {d["ip"]: d for d in get_all_devices()}
-        devices = []
-        for index, result in enumerate(scanned, start=1):
-            ip = result.get("ip", "")
-            if not ip:
-                continue
-            community = result.get("community", req.communities[0] if req.communities else "public")
-            if not result.get("ports"):
-                continue
-            if ip in existing_by_ip:
-                record = {**existing_by_ip[ip], **_scanned_device_record(result, index), "id": existing_by_ip[ip]["id"]}
-                save_device(record)
-                devices.append(record)
-                continue
-            record = _scanned_device_record(result, index)
-            save_device(record)
-            devices.append(record)
-        links = await discover_topology_links(get_all_devices())
-        return {"ok": True, "devices": devices, "count": len(devices), "new_count": sum(1 for d in devices if d["ip"] not in existing_by_ip), "links": links}
-    except Exception as e:
-        logger.error(f"Network scan error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return await run_discovery_endpoint(DiscoveryRequest(subnet=req.network, communities=req.communities))
 # ------------------ WEBSOCKET ENDPOINT ------------------ #
 
 @app.websocket("/ws/events")

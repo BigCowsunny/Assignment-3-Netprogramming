@@ -6,6 +6,8 @@ import { EditDeviceModal } from './EditDeviceModal';
 import { Device } from '../../types/snmp';
 import { scanSerial, scanSerialWithPort } from '../../services/serial';
 import { scanNetwork } from '../../services/networkDiscovery';
+import { startCdpCaptureApi } from '../../services/api';
+import { configurationWarning } from '../../utils/deviceManagement';
 
 export const DevicesView: React.FC = () => {
   const {
@@ -396,6 +398,23 @@ export const DevicesView: React.FC = () => {
     refreshDeviceData();
   };
 
+  const handleCdpCapture = async () => {
+    setScanning(true);
+    try {
+      const status = await startCdpCaptureApi();
+      if (status.status === 'unavailable' || status.status === 'disabled') {
+        addToast('bad', 'ยังตรวจจับ CDP/LLDP ไม่ได้', status.error || 'ตัวรับ CDP/LLDP ถูกปิดในการตั้งค่า Backend');
+      } else {
+        addToast('', status.status === 'listening' ? 'กำลังรับ CDP/LLDP จากสายเครือข่าย' : 'กำลังเริ่มตัวรับ CDP/LLDP', 'รออุปกรณ์ส่ง CDP/LLDP; อุปกรณ์ที่ไม่มี IP จะแสดงพร้อมคำเตือนว่า Config ไม่ได้');
+      }
+      refreshDeviceData();
+    } catch (error) {
+      addToast('bad', 'ตรวจจับ CDP/LLDP ไม่สำเร็จ', error instanceof Error ? error.message : String(error));
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const handleNetworkScan = async () => {
     setScanning(true);
     setShowEveNGModal(false);
@@ -407,14 +426,14 @@ export const DevicesView: React.FC = () => {
       );
       let addedCount = 0;
       for (const result of results) {
-        if (!result.name || devices.some((device) => device.ip === result.ip)) continue;
+        if (!result.name || devices.some((device) => device.id === result.id)) continue;
         addDevice(result as Device);
         addedCount++;
       }
       addToast(
         addedCount ? 'ok' : '',
         addedCount ? `พบอุปกรณ์ใหม่ ${addedCount} เครื่อง` : 'ไม่พบอุปกรณ์ใหม่',
-        `ตรวจพบผ่าน SNMP ใน ${scanNetworkCidr}`,
+        `ตรวจ SNMP ใน ${scanNetworkCidr} และอ่าน CDP neighbor จากอุปกรณ์ที่ Monitor`,
       );
       refreshDeviceData();
     } catch (error) {
@@ -433,6 +452,7 @@ export const DevicesView: React.FC = () => {
   });
 
   const getPortRatio = (d: (typeof devices)[0]) => {
+    if (d.discovery_only) return `${d.ports.length} พบผ่าน CDP/LLDP`;
     const ps = d.ports.filter((p) => !p.virtual);
     const u = ps.filter((p) => p.admin === 'up' && p.oper === 'up').length;
     return `${u}/${ps.length}`;
@@ -457,6 +477,10 @@ export const DevicesView: React.FC = () => {
           <button className="btn btn-ghost" onClick={handleScan} disabled={scanning}>
             <Icon name="i-server" />
             COM Port
+          </button>
+          <button className="btn btn-ghost" onClick={handleCdpCapture} disabled={scanning}>
+            <Icon name="i-radar" />
+            ตรวจจับ CDP/LLDP
           </button>
           <button className="btn btn-ghost" onClick={() => setIsAddModalOpen(true)}>
             <Icon name="i-plus" />
@@ -494,6 +518,7 @@ export const DevicesView: React.FC = () => {
           <option value="all">สถานะ: ทั้งหมด</option>
           <option value="online">ออนไลน์</option>
           <option value="offline">ออฟไลน์</option>
+          <option value="discovered">พบผ่าน CDP/LLDP</option>
         </select>
 
         <span className="spacer"></span>
@@ -526,6 +551,8 @@ export const DevicesView: React.FC = () => {
                         <span className="pill ok">
                           <i></i>ออนไลน์
                         </span>
+                      ) : d.status === 'discovered' ? (
+                        <span className="pill warn"><i></i>พบผ่าน CDP/LLDP</span>
                       ) : (
                         <span className="pill bad">
                           <i></i>ออฟไลน์
@@ -539,14 +566,15 @@ export const DevicesView: React.FC = () => {
                       >
                         {d.name}
                       </button>
-                      <div className="sub">{d.ip}</div>
+                      <div className="sub">{d.ip || 'ไม่มี IP'}</div>
+                      {configurationWarning(d) && <div className="hint" role="status">{configurationWarning(d)}</div>}
                     </td>
                     <td>{d.type === 'switch' ? 'Switch' : 'Router'}</td>
                     <td className="hint">{d.vendor}</td>
                     <td className="mono">{d.up}</td>
                     <td className="mono">{getPortRatio(d)}</td>
                     <td className="mono">
-                      {d.ver} · SET ตรวจที่อุปกรณ์
+                      {d.discovery_only ? 'Config ไม่ได้' : `${d.ver} · SET ตรวจที่อุปกรณ์`}
                     </td>
                     <td className="r">
                       <button
@@ -561,7 +589,7 @@ export const DevicesView: React.FC = () => {
                         title="แก้ไขอุปกรณ์"
                       >
                         <Icon name="i-set" />
-                        แก้ไข
+                        {d.discovery_only ? 'ตั้งค่า IP/SNMP' : 'แก้ไข'}
                       </button>{' '}
                       <button
                         className="btn btn-ghost danger-txt"

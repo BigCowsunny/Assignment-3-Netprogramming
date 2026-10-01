@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Callable, Optional, Set
 from fastapi import WebSocket
 from pyasn1.codec.ber import decoder
@@ -52,7 +53,7 @@ ws_manager = WebSocketManager()
 async def _discover_from_trap(source_ip: str, community: str) -> Optional[dict]:
     """Enroll an unknown trap sender only after SNMP GET and IF-MIB confirm it."""
     current = next((item for item in get_all_devices() if item.get("ip") == source_ip), None)
-    if current:
+    if current and not current.get("discovery_only"):
         return current
 
     if not community:
@@ -129,6 +130,8 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
             msg, _ = decoder.decode(data, asn1Spec=api.v2c.Message())
             community = str(api.v2c.apiMessage.get_community(msg))
             pdu = api.v2c.apiMessage.get_pdu(msg)
+            if pdu.tagSet != api.v2c.SNMPv2TrapPDU.tagSet:
+                return None
             varbinds = api.v2c.apiPDU.get_varbinds(pdu)
 
             trap_type = "unknown"
@@ -146,38 +149,30 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
 
                 if oid_str == OID_SNMP_TRAP_OID:
                     trap_oid = val_str
-                    if OID_LINK_DOWN in val_str:
+                    if OID_LINK_DOWN == val_str:
                         trap_type = "linkDown"
-                    elif OID_LINK_UP in val_str:
+                    elif OID_LINK_UP == val_str:
                         trap_type = "linkUp"
-                elif ".1.3.6.1.2.1.2.2.1.1." in oid_str:  # ifIndex
+                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.1."):  # ifIndex
                     try:
                         if_index = int(val_str)
                     except Exception:
                         pass
-                elif ".1.3.6.1.2.1.2.2.1.7." in oid_str:  # ifAdminStatus
+                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.7."):  # ifAdminStatus
                     try:
                         admin_status = "up" if int(val_str) == 1 else "down"
                     except Exception:
                         pass
-                elif ".1.3.6.1.2.1.2.2.1.8." in oid_str:  # ifOperStatus
+                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.8."):  # ifOperStatus
                     try:
                         oper_status = "up" if int(val_str) == 1 else "down"
                     except Exception:
                         pass
-                elif ".1.3.6.1.2.1.2.2.1.2." in oid_str:  # ifDescr
+                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.2."):  # ifDescr
                     if_name = val_str
 
-            # Fallback deduction if trap_oid wasn't explicitly standard
             if trap_type == "unknown":
-                if oper_status == "down" or admin_status == "down":
-                    trap_type = "linkDown"
-                    trap_oid = OID_LINK_DOWN
-                elif oper_status == "up":
-                    trap_type = "linkUp"
-                    trap_oid = OID_LINK_UP
-                else:
-                    return None
+                return None
 
             return {
                 "source_ip": src_ip,
@@ -223,7 +218,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         devices = get_all_devices()
         matched_dev = None
         for dev in devices:
-            if dev["ip"] == src_ip:
+            if dev["ip"] == src_ip and not dev.get("discovery_only"):
                 matched_dev = dev
                 break
 
@@ -235,16 +230,16 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
 
         # Determine port name
         port_name = trap_data["if_name"]
-        if not port_name and matched_dev and trap_data["if_index"]:
+        if matched_dev and trap_data["if_index"]:
             for p in matched_dev.get("ports", []):
                 if p["idx"] == trap_data["if_index"]:
                     port_name = p["name"]
                     break
 
         if not port_name:
-            port_name = f"ifIndex {trap_data.get('if_index') or '1'}"
+            port_name = f"ifIndex {trap_data['if_index']}" if trap_data.get("if_index") else "Unknown interface"
 
-        evt_id = f"e_{int(time.time()*1000)}"
+        evt_id = f"e_{uuid.uuid4().hex}"
         logger.info(f"TRAP RECEIVED: {trap_type} on {device_name} ({src_ip}) Port {port_name}")
 
         # Update interface oper status in DB if device is known

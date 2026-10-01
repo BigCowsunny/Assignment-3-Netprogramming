@@ -16,7 +16,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     ObjectIdentity,
     get_cmd,
     set_cmd,
-    next_cmd,
+    walk_cmd,
     bulk_cmd,
 )
 from pysnmp.proto.rfc1902 import Integer32, OctetString
@@ -101,6 +101,8 @@ async def snmp_get_system_info(ip: str, community: str = "public", port: int = 1
         return res
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        engine.close_dispatcher()
 
 
 async def snmp_set_admin_status(
@@ -177,6 +179,8 @@ async def snmp_set_admin_status(
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        engine.close_dispatcher()
 
 
 async def snmp_walk_interfaces(
@@ -195,7 +199,7 @@ async def snmp_walk_interfaces(
         transport = await UdpTransportTarget.create((ip, port), timeout=timeout, retries=1)
 
         # Walk ifDescr
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -214,8 +218,8 @@ async def snmp_walk_interfaces(
                         "idx": if_idx,
                         "name": descr,
                         "speed": 1000,
-                        "admin": "up",
-                        "oper": "up",
+                        "admin": "unknown",
+                        "oper": "unknown",
                         "errors": 0,
                         "mac": "",
                         "alias": "",
@@ -224,7 +228,7 @@ async def snmp_walk_interfaces(
                     }
 
         # Walk ifAdminStatus
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -244,7 +248,7 @@ async def snmp_walk_interfaces(
                         pass
 
         # Walk ifOperStatus
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -264,7 +268,7 @@ async def snmp_walk_interfaces(
                         pass
 
         # Walk ifSpeed
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -296,7 +300,7 @@ async def snmp_walk_interfaces(
         )
         for base_oid, field in optional_columns:
             try:
-                async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+                async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
                     engine,
                     CommunityData(community),
                     transport,
@@ -338,6 +342,8 @@ async def snmp_walk_interfaces(
 
     except Exception as e:
         logger.warning(f"Interface walk failed for {ip}: {e}")
+    finally:
+        engine.close_dispatcher()
 
     return sorted(list(interfaces.values()), key=lambda x: x["idx"])
 
@@ -359,7 +365,7 @@ async def snmp_poll_octets(
         transport = await UdpTransportTarget.create((ip, port), timeout=2.0, retries=1)
 
         # Walk ifHCInOctets
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -382,7 +388,7 @@ async def snmp_poll_octets(
                     pass
 
         # Walk ifHCOutOctets
-        async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
             engine,
             CommunityData(community),
             transport,
@@ -407,7 +413,7 @@ async def snmp_poll_octets(
         # Old switches and some EVE images expose only the 32-bit IF-MIB counters.
         missing_in = [idx for idx in (if_indices or []) if results.get(idx, {}).get("in_octets") is None]
         if missing_in:
-            async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+            async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
                 engine, CommunityData(community), transport, ContextData(),
                 ObjectType(ObjectIdentity(OID_IF_IN_OCTETS)), lexicographicMode=False,
             ):
@@ -426,7 +432,7 @@ async def snmp_poll_octets(
 
         missing_out = [idx for idx in (if_indices or []) if results.get(idx, {}).get("out_octets") is None]
         if missing_out:
-            async for (errorIndication, errorStatus, _, varBinds) in next_cmd(
+            async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
                 engine, CommunityData(community), transport, ContextData(),
                 ObjectType(ObjectIdentity(OID_IF_OUT_OCTETS)), lexicographicMode=False,
             ):
@@ -444,5 +450,7 @@ async def snmp_poll_octets(
                         pass
     except Exception as e:
         logger.warning(f"Octet poll failed for {ip}: {e}")
+    finally:
+        engine.close_dispatcher()
 
     return results

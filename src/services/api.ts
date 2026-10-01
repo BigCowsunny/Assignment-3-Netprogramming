@@ -170,14 +170,57 @@ export async function fetchLatestTrafficApi() {
   return res.json();
 }
 
-export async function runDiscoveryApi(seedIp?: string, community = 'public', subnet = '') {
-  const res = await fetch(`${API_BASE_URL}/discovery`, {
+export interface DiscoveryIssue {
+  ip: string;
+  name?: string;
+  code: string;
+  message: string;
+}
+
+export interface DiscoveryProgress {
+  id: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  phase: string;
+  current_ip: string;
+  current_name: string;
+  checked: number;
+  queued: number;
+  devices_count: number;
+  links_count: number;
+  issues: DiscoveryIssue[];
+  error?: string;
+  result?: { devices: import('../types/snmp').Device[]; links: import('../types/snmp').TopologyLink[]; issues: DiscoveryIssue[] };
+}
+
+export async function runDiscoveryApi(
+  target = '',
+  communities: string[] = [],
+  onProgress?: (progress: DiscoveryProgress) => void,
+) {
+  const input = target.trim();
+  const request = input.includes('/') ? { subnet: input } : { seed_ip: input };
+  const res = await fetch(`${API_BASE_URL}/discovery/jobs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ seed_ip: seedIp, community, subnet }),
+    body: JSON.stringify({ ...request, communities }),
   });
-  if (!res.ok) throw new Error('Failed to run discovery');
-  return res.json();
+  if (!res.ok) {
+    const error = await res.json().catch(() => null);
+    throw new Error(error?.detail || 'เริ่ม Discovery ไม่สำเร็จ');
+  }
+  let progress = await res.json() as DiscoveryProgress;
+  onProgress?.(progress);
+  while (progress.status === 'running') {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    const status = await fetch(`${API_BASE_URL}/discovery/jobs/${progress.id}`);
+    if (!status.ok) throw new Error('อ่านสถานะ Discovery ไม่สำเร็จ');
+    progress = await status.json() as DiscoveryProgress;
+    onProgress?.(progress);
+  }
+  if (progress.status !== 'completed' || !progress.result) {
+    throw new Error(progress.error || 'Discovery ถูกยกเลิก');
+  }
+  return progress.result;
 }
 
 export function connectTrapWebSocket(
@@ -209,4 +252,23 @@ export function connectTrapWebSocket(
     console.warn('Could not establish WebSocket connection:', err);
     return null;
   }
+}
+
+export interface CdpCaptureStatus {
+  status: 'stopped' | 'disabled' | 'starting' | 'listening' | 'unavailable';
+  error: string;
+  interfaces: string[];
+}
+
+export async function startCdpCaptureApi(): Promise<CdpCaptureStatus> {
+  const response = await fetch(`${API_BASE_URL}/discovery/cdp/start`, { method: 'POST' });
+  if (!response.ok) throw new Error('เริ่มตรวจจับ CDP/LLDP ไม่สำเร็จ');
+  let status = await response.json() as CdpCaptureStatus;
+  for (let attempt = 0; status.status === 'starting' && attempt < 5; attempt++) {
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    const check = await fetch(`${API_BASE_URL}/discovery/cdp/status`);
+    if (!check.ok) throw new Error('ตรวจสถานะ CDP/LLDP ไม่สำเร็จ');
+    status = await check.json() as CdpCaptureStatus;
+  }
+  return status;
 }
