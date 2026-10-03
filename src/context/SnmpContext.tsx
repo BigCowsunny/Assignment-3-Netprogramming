@@ -15,6 +15,7 @@ import { runDiscoveryApi, DiscoveryProgress } from '../services/api';
 import { configurationWarning, escapeHtml, mergeDevices } from '../utils/deviceManagement';
 import {
   checkBackendHealth,
+  fetchBackendHealth,
   fetchDevicesApi,
   createDeviceApi,
   updateDeviceApi,
@@ -50,6 +51,8 @@ interface SnmpContextType {
   toasts: ToastMessage[];
   confirmDialog: ConfirmDialogOptions | null;
   pollingCountdown: number;
+  pollIntervalSeconds: number;
+  setPollIntervalSeconds: (seconds: number) => void;
 
   // Active items
   activeDevice: Device | undefined;
@@ -88,6 +91,7 @@ const SnmpContext = createContext<SnmpContextType | null>(null);
 export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [isBackendConnected, setIsBackendConnected] = useState<boolean>(false);
   const [isBootstrapped, setIsBootstrapped] = useState<boolean>(false);
+  const [pollIntervalSeconds, setPollIntervalSeconds] = useState(60);
   const [devices, setDevices] = useState<Device[]>([]);
   const [topologyLinks, setTopologyLinks] = useState<TopologyLink[]>([]);
 
@@ -126,9 +130,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   useEffect(() => {
     let active = true;
     const loadBackendState = async () => {
-      const healthy = await checkBackendHealth();
+      const health = await fetchBackendHealth().catch(() => null);
+      const healthy = health?.status === 'online';
       if (!active) return;
       setIsBackendConnected(healthy);
+      if (health?.poll_interval) setPollIntervalSeconds(health.poll_interval);
       if (!healthy) {
         setIsBootstrapped(true);
         return;
@@ -163,6 +169,20 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     };
     void loadBackendState();
     return () => { active = false; };
+  }, []);
+
+  // Keep connection indicators current without replacing monitoring data.
+  useEffect(() => {
+    let active = true;
+    const timer = window.setInterval(() => {
+      void fetchBackendHealth().then(health => {
+        if (active) {
+          setIsBackendConnected(health.status === 'online');
+          if (health.poll_interval) setPollIntervalSeconds(health.poll_interval);
+        }
+      }).catch(() => { if (active) setIsBackendConnected(false); });
+    }, 15000);
+    return () => { active = false; window.clearInterval(timer); };
   }, []);
 
   // Clean up topology positions for deleted devices after backend state has been loaded.
@@ -379,11 +399,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
     openConfirm({
       title: turnDown ? 'ยืนยันการปิดพอร์ต' : 'ยืนยันการเปิดพอร์ต',
-      body: `อุปกรณ์ <b>${escapeHtml(dev.name)}</b> <span class="mono">${escapeHtml(dev.ip)}</span><br>พอร์ต <b class="mono">${escapeHtml(port.name)}</b> · ifAdminStatus.${port.idx} → ${turnDown ? '2 (down)' : '1 (up)'}${
+      body: `อุปกรณ์ <b>${escapeHtml(dev.name)}</b> <span class="mono">${escapeHtml(dev.ip)}</span><br>พอร์ต <b class="mono">${escapeHtml(port.name)}</b> · ${turnDown ? 'Shutdown' : 'No Shutdown'}${
         isUplink
-          ? '<br><br><span class="hint">หมายเหตุ: พอร์ตนี้เป็น Uplink — ถ้าปิด การเชื่อมต่อชั้นเหนือขึ้นไปจะขาดทันที</span>'
+          ? '<br><br><span class="hint">หมายเหตุ: การปิดพอร์ตจะตัดการเชื่อมต่อของอุปกรณ์ที่ใช้พอร์ตนี้</span>'
           : ''
-      }<br><br><span class="hint">ระบบจะส่ง SNMP SET แล้วอ่านค่ากลับมาตรวจ (FR-3.4) และบันทึก Audit log</span>`,
+      }<br><br><span class="hint">ระบบจะเปลี่ยนสถานะพอร์ต ตรวจสอบผลจากอุปกรณ์ และบันทึก Audit log</span>`,
       okText: turnDown ? 'สั่ง Shutdown' : 'สั่ง No Shutdown',
       danger: turnDown,
       onConfirm: () => {
@@ -462,7 +482,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     } catch (error) {
       setDiscoveryProgress((previous) => previous ? { ...previous, status: 'failed', phase: 'failed', error: error instanceof Error ? error.message : String(error) } : null);
       addAuditLog('Auto Discovery (SNMP)', options.network || '', 'ล้มเหลว');
-      addToast('bad', 'Discovery ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และข้อมูลการเชื่อมต่อ');
+      addToast('bad', 'Discovery ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบสถานะบริการระบบและข้อมูลการเชื่อมต่ออุปกรณ์');
     }
   };
 
@@ -495,10 +515,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const refreshDeviceData = () => {
-    setPollingCountdown(60);
+    setPollingCountdown(pollIntervalSeconds);
     void fetchDevicesApi().then((freshDevices: Device[]) => {
       setDevices(freshDevices);
-      addToast('', 'รีเฟรชแล้ว', 'อ่านสถานะและ interface ล่าสุดจาก Backend/SNMP');
+      addToast('', 'รีเฟรชแล้ว', 'อัปเดตสถานะอุปกรณ์และพอร์ตจากข้อมูล SNMP ล่าสุดแล้ว');
     }).catch((error) => addToast('bad', 'รีเฟรชไม่สำเร็จ', error instanceof Error ? error.message : String(error)));
     void fetchTopologyApi().then((topology) => {
       setTopologyLinks(topology.links || []);
@@ -515,16 +535,27 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   // Poller countdown ticker
   useEffect(() => {
+    setPollingCountdown(pollIntervalSeconds);
     const timer = setInterval(() => {
       setPollingCountdown((prev) => {
         if (prev <= 1) {
-          return 60;
+          return pollIntervalSeconds;
         }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [pollIntervalSeconds]);
+
+  useEffect(() => {
+    if (!isBackendConnected) return;
+    const timer = window.setInterval(() => {
+      void fetchDevicesApi().then((fresh: Device[]) => setDevices(previous =>
+        mergeDevices(previous.filter(device => device.ip === 'Serial (COM)'), fresh)
+      )).catch(() => {});
+    }, pollIntervalSeconds * 1000);
+    return () => window.clearInterval(timer);
+  }, [pollIntervalSeconds, isBackendConnected]);
 
   // Keep passive discovery/TTL and backend inventory visible even after a missed WS message.
   useEffect(() => {
@@ -619,6 +650,8 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         toasts,
         confirmDialog,
         pollingCountdown,
+        pollIntervalSeconds,
+        setPollIntervalSeconds,
         activeDevice,
         activePort,
         setView,

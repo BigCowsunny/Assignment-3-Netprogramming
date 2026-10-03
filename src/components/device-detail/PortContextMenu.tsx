@@ -28,13 +28,21 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
   const warning = configurationWarning(device);
 
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
     const handleClickOutside = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         onClose();
       }
     };
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape' || e.key === 'Tab') onClose();
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const items = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])];
+        const current = items.indexOf(document.activeElement as HTMLButtonElement);
+        items[(current + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus();
+      }
     };
 
     document.addEventListener('mousedown', handleClickOutside);
@@ -42,14 +50,15 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('keydown', handleKeyDown);
+      if (previous?.isConnected) previous.focus();
     };
   }, [onClose]);
 
   // Adjust position to stay on screen
   let posX = x;
   let posY = y;
-  if (posX + 230 > window.innerWidth - 10) posX = window.innerWidth - 240;
-  if (posY + 120 > window.innerHeight - 10) posY = window.innerHeight - 130;
+  posX = Math.max(12, Math.min(posX, window.innerWidth - 292));
+  posY = Math.max(12, Math.min(posY, window.innerHeight - 250));
 
   return (
     <div
@@ -57,6 +66,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
       className="port-menu"
       style={{ left: `${posX}px`, top: `${posY}px` }}
       role="menu"
+      aria-label={'จัดการ ' + port.name}
     >
       <div className="pm-head">
         <b>{port.name}</b>
@@ -66,6 +76,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
       </div>
 
       <button
+        role="menuitem"
         disabled={!!warning}
         title={warning}
         onClick={() => {
@@ -79,6 +90,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
 
       {isUp ? (
         <button
+          role="menuitem"
           className="danger"
           disabled={!!warning}
           title={warning}
@@ -92,6 +104,7 @@ export const PortContextMenu: React.FC<PortContextMenuProps> = ({
         </button>
       ) : (
         <button
+          role="menuitem"
           disabled={!!warning}
           title={warning}
           onClick={() => {

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { pad } from '../../utils/formatters';
+import netsmonitorLogo from '../../assets/netsmonitor-logo.png';
 
 export const Topbar: React.FC = () => {
   const { searchQuery, setSearchQuery, setView, isBackendConnected } = useSnmp();
@@ -26,13 +27,11 @@ export const Topbar: React.FC = () => {
   return (
     <header className="topbar">
       <div className="brand">
-        <span className="mark">
-          <Icon name="i-topo" />
-        </span>
-        SNMP Network Monitor <small>v1.0</small>
+        <img className="brand-logo" src={netsmonitorLogo} width="34" height="34" alt="" />
+        <span>NetSmonitor <small>v1.0</small></span>
       </div>
 
-      <span className="demo-badge">{isBackendConnected ? 'ข้อมูลจาก Backend · SNMP/CDP/LLDP' : 'Backend ยังไม่เชื่อมต่อ'}</span>
+      <span className="demo-badge">SNMP · CDP · LLDP</span>
 
       <div className="spacer"></div>
 
@@ -48,7 +47,7 @@ export const Topbar: React.FC = () => {
       </label>
 
       <span className="live-chip">
-        <span className="dot"></span>WebSocket เชื่อมต่อแล้ว
+        <span className={isBackendConnected ? 'dot' : 'connection-off'}></span>{isBackendConnected ? 'บริการระบบพร้อมใช้งาน' : 'ขาดการเชื่อมต่อกับบริการระบบ'}
       </span>
 
       <span id="clock">{time}</span>

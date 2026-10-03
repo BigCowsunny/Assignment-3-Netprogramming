@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useSnmp } from '../../context/SnmpContext';
 import { TrafficCanvas } from '../common/TrafficCanvas';
 import { calculateStats } from '../../utils/trafficGenerator';
 import { fmtRate } from '../../utils/formatters';
@@ -6,6 +7,7 @@ import { TrafficPoint } from '../../types/snmp';
 import { fetchAggregateTrafficApi } from '../../services/api';
 
 export const TrafficOverviewCard: React.FC = () => {
+  const { pollIntervalSeconds } = useSnmp();
   const [aggregatePoints, setAggregatePoints] = useState<TrafficPoint[]>([]);
   useEffect(() => {
     let active = true;
@@ -18,9 +20,9 @@ export const TrafficOverviewCard: React.FC = () => {
       }
     };
     void load();
-    const timer = window.setInterval(() => { void load(); }, 60_000);
+    const timer = window.setInterval(() => { void load(); }, pollIntervalSeconds * 1000);
     return () => { active = false; window.clearInterval(timer); };
-  }, []);
+  }, [pollIntervalSeconds]);
 
   const maxIn = useMemo(() => {
     return calculateStats(aggregatePoints, 'in');
@@ -29,13 +31,13 @@ export const TrafficOverviewCard: React.FC = () => {
   return (
     <div className="card">
       <div className="card-head">
-        <h3>ทราฟฟิกรวมทั้งระบบ · 24 ชั่วโมง</h3>
+        <h3>ทราฟฟิกรวม <span className="hint">/ 24 ชั่วโมง</span></h3>
         <span className="hint mono">
           {maxIn ? `Peak In ${fmtRate(maxIn.max)}` : '—'}
         </span>
       </div>
       <div className="card-body">
-        <TrafficCanvas points={aggregatePoints} range="day" />
+        <TrafficCanvas points={aggregatePoints} range="day" pollIntervalSeconds={pollIntervalSeconds} />
       </div>
     </div>
   );

@@ -56,7 +56,7 @@ export const TopologyConnections: React.FC<Props> = ({ devices, positions, links
         <rect x={-64} y={-23} width={128} height={46} rx={12} />
         <text className="segment-name" x={0} y={-2}>เครือข่ายร่วม</text>
         <text className="segment-meta" x={0} y={14}>
-          {segment.protocols.join('/') + ' · ' + segment.members.length + ' พอร์ต'}
+          {'อนุมาน · ' + segment.members.length + ' พอร์ต'}
         </text>
       </g>)}
     </g>

@@ -1,6 +1,7 @@
 import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { useLatestTraffic } from '../../hooks/useLatestTraffic';
+import { fmtPercent } from '../../utils/formatters';
 
 export const KpiGrid: React.FC = () => {
   const { devices, events } = useSnmp();
@@ -21,7 +22,12 @@ export const KpiGrid: React.FC = () => {
     });
   });
 
-  const downEventsCount = events.filter((e) => e.type === 'linkDown').length;
+  const recentEvents = events.filter(e => e.t.getTime() >= Date.now() - 86400000);
+  const downEventsCount = recentEvents.filter((e) => e.type === 'linkDown').length;
+  const discoveredCount = devices.filter(d => d.discovery_only || d.status === 'discovered').length;
+  const offlineCount = devices.filter(d => !d.discovery_only && d.status === 'offline').length;
+  const unknownPorts = devices.filter(d => !d.discovery_only).flatMap(d => d.ports)
+    .filter(p => !p.virtual && (p.oper === 'unknown' || p.admin === 'unknown')).length;
 
   let sumUtil = 0;
   let sampleCount = 0;
@@ -30,7 +36,6 @@ export const KpiGrid: React.FC = () => {
     if (d.status !== 'online') return;
     d.ports
       .filter((p) => !p.virtual && p.admin === 'up' && p.oper === 'up')
-      .slice(0, 3)
       .forEach((p) => {
         const sample = latestTraffic.find((row) => row.device_id === d.id && row.port_name === p.name);
         if (sample && p.speed > 0) {
@@ -40,7 +45,7 @@ export const KpiGrid: React.FC = () => {
       });
   });
 
-  const avgLoad = sampleCount ? Math.round(sumUtil / sampleCount) : 0;
+  const avgLoad = sampleCount ? sumUtil / sampleCount : null;
 
   return (
     <div className="grid4">
@@ -50,7 +55,7 @@ export const KpiGrid: React.FC = () => {
           {onlineCount}/{devices.length}
         </div>
         <div className="s">
-          ออนไลน์ {onlineCount} · ออฟไลน์ {devices.length - onlineCount}
+          Offline {offlineCount} · Discovered {discoveredCount}
         </div>
       </div>
 
@@ -60,21 +65,21 @@ export const KpiGrid: React.FC = () => {
           {upPorts}/{totalPorts}
         </div>
         <div className="s">
-          ปิดอยู่ {totalPorts - upPorts} · error {errorPorts}
+          Down {totalPorts - upPorts - unknownPorts} · Unknown {unknownPorts} · Errors {errorPorts}
         </div>
       </div>
 
       <div className="card kpi">
         <div className="lbl">เหตุการณ์ 24 ชม.</div>
-        <div className="v">{events.length}</div>
+        <div className="v">{recentEvents.length}</div>
         <div className="s">
-          linkDown {downEventsCount} · linkUp {events.length - downEventsCount}
+          Link down {downEventsCount} · Link up {recentEvents.length - downEventsCount}
         </div>
       </div>
 
       <div className="card kpi">
         <div className="lbl">โหลดเฉลี่ย</div>
-        <div className="v">{sampleCount ? `${avgLoad}%` : '—'}</div>
+        <div className="v">{fmtPercent(avgLoad)}</div>
         <div className="s">{sampleCount ? 'จาก sample SNMP ล่าสุด' : 'รอ sample SNMP จาก poller'}</div>
       </div>
     </div>

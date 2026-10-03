@@ -15,6 +15,11 @@ export function fmtSpeed(mbps: number): string {
   return mbps >= 1000 ? mbps / 1000 + ' Gbps' : mbps + ' Mbps';
 }
 
+export function fmtPercent(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return value > 0 && value < 1 ? '<1%' : Math.round(value) + '%';
+}
+
 export function fmtHM(t: Date | number | string): string {
   const d = new Date(t);
   return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());

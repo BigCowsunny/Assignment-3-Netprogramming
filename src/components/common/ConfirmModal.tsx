@@ -1,19 +1,12 @@
-import React, { useEffect } from 'react';
+import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from './Icons';
+import { useDeviceDialog } from '../devices/useDeviceDialog';
 
 export const ConfirmModal: React.FC = () => {
   const { confirmDialog, closeConfirm } = useSnmp();
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && confirmDialog) {
-        closeConfirm();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [confirmDialog, closeConfirm]);
+  const dialogRef = useDeviceDialog(!!confirmDialog, closeConfirm, '[data-cancel]');
 
   if (!confirmDialog) return null;
 
@@ -21,12 +14,14 @@ export const ConfirmModal: React.FC = () => {
     <div className="modal" onClick={closeConfirm}>
       <div
         className="sheet narrow"
+        ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sheet-head">
-          <h2>
+          <h2 id="confirm-dialog-title">
             {confirmDialog.danger && (
               <span style={{ color: 'var(--danger)' }}>
                 <Icon name="i-triangle-alert" />
@@ -44,6 +39,7 @@ export const ConfirmModal: React.FC = () => {
         />
         <div className="sheet-foot">
           <button
+            data-cancel
             className="btn"
             onClick={() => {
               if (confirmDialog.onCancel) confirmDialog.onCancel();

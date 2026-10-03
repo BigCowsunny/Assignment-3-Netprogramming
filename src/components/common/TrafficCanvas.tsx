@@ -6,6 +6,7 @@ interface TrafficCanvasProps {
   points: TrafficPoint[];
   range: string;
   isTall?: boolean;
+  pollIntervalSeconds?: number;
 }
 
 export interface TrafficCanvasRef {
@@ -22,7 +23,7 @@ interface TooltipState {
 }
 
 export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
-  ({ points, range, isTall }, ref) => {
+  ({ points, range, isTall, pollIntervalSeconds = 60 }, ref) => {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const containerRef = useRef<HTMLDivElement | null>(null);
     const [tooltip, setTooltip] = useState<TooltipState>({
@@ -72,10 +73,10 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
 
       let rawMax = 0;
       points.forEach((p) => {
-        if (p.in != null) rawMax = Math.max(rawMax, p.in, p.out || 0);
+        rawMax = Math.max(rawMax, p.in || 0, p.out || 0);
       });
 
-      const hasData = rawMax > 0;
+      const hasData = points.some(point => point.in != null || point.out != null);
       const mx = niceMax(rawMax || 1);
 
       const borderCol = '#e5e7eb';
@@ -101,15 +102,18 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
       }
 
       // Draw X-axis timestamps
-      const stepX = Math.max(1, Math.ceil(points.length / 7));
+      const start = points[0]?.t || Date.now();
+      const span = Math.max(1, (points[points.length - 1]?.t || start) - start);
+      const X = (i: number) => L + (points.length === 1 ? iw / 2 : (points[i].t - start) / span * iw);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
 
-      points.forEach((p, i) => {
-        if (i % stepX !== 0) return;
-        const x = L + (i / (points.length - 1 || 1)) * iw;
-        ctx.fillText(xfmt(p.t, range), x, T + ih + 8);
-      });
+      if (points.length) {
+        const ticks = Math.max(2, Math.min(6, Math.floor(iw / 100)));
+        for (let i = 0; i <= ticks; i++) {
+          ctx.fillText(xfmt(start + span * i / ticks, range), L + iw * i / ticks, T + ih + 8);
+        }
+      }
 
       hitPointsRef.current = [];
 
@@ -119,33 +123,30 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
         ctx.textBaseline = 'middle';
         ctx.font = '500 13.5px "IBM Plex Sans Thai", system-ui, sans-serif';
         ctx.fillText(
-          'ไม่มีข้อมูลในช่วงเวลาที่เลือก — อุปกรณ์อาจออฟไลน์หรือยังไม่มีข้อมูลสะสม',
+          iw < 520 ? 'ยังไม่มีข้อมูลในช่วงนี้' : 'ยังไม่มีข้อมูลในช่วงเวลาที่เลือก',
           L + iw / 2,
           T + ih / 2
         );
         return;
       }
 
-      const X = (i: number) => L + (i / (points.length - 1 || 1)) * iw;
       const Y = (v: number | null) => (v == null ? T + ih : T + ih - (v / mx) * ih);
 
-      // Separate continuous segments to handle data gaps
-      const segs: number[][] = [];
-      let currentSeg: number[] = [];
-
-      points.forEach((p, i) => {
-        if (p.in == null) {
-          if (currentSeg.length) segs.push(currentSeg);
-          currentSeg = [];
-        } else {
-          currentSeg.push(i);
-        }
-      });
-      if (currentSeg.length) segs.push(currentSeg);
-
-      // Render lines & area fill
-      segs.forEach((sg) => {
-        (['in', 'out'] as const).forEach((key, ki) => {
+      // Place samples at actual timestamps and break lines across missing buckets.
+      const buckets: Record<string, number> = {live:5000,day:300000,week:1800000,month:7200000,year:86400000};
+      const gapMs = Math.max(pollIntervalSeconds * 1500, (buckets[range] || 300000) * 1.5);
+      (['in', 'out'] as const).forEach((key, ki) => {
+        const segs: number[][] = [];
+        let segment: number[] = [];
+        points.forEach((point, i) => {
+          if (segment.length && point.t - points[segment[segment.length - 1]].t > gapMs) {
+            segs.push(segment); segment = [];
+          }
+          if (point[key] == null) { if(segment.length) segs.push(segment); segment = []; }
+          else segment.push(i);
+        });
+        if (segment.length) segs.push(segment);
+        segs.forEach((sg) => {
           ctx.beginPath();
           sg.forEach((i, j) => {
             const x = X(i);
@@ -154,10 +155,14 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
             else ctx.lineTo(x, y);
           });
 
-          ctx.strokeStyle = ki === 0 ? 'oklch(46% 0.14 145)' : 'oklch(55% 0.10 245)';
+          ctx.strokeStyle = ki === 0 ? '#245edb' : '#129683';
           ctx.lineWidth = 1.8;
           ctx.lineJoin = 'round';
           ctx.stroke();
+          if (sg.length === 1) {
+            ctx.beginPath(); ctx.arc(X(sg[0]), Y(points[sg[0]][key]), 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = ki === 0 ? '#245edb' : '#129683'; ctx.fill();
+          }
 
           // Gradient fill under the In line
           if (ki === 0) {
@@ -166,7 +171,7 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
             sg.forEach((i) => ctx.lineTo(X(i), Y(points[i][key])));
             ctx.lineTo(X(sg[sg.length - 1]), T + ih);
             ctx.closePath();
-            ctx.fillStyle = 'rgba(74, 222, 128, 0.12)';
+            ctx.fillStyle = 'rgba(36, 94, 219, 0.08)';
             ctx.fill();
           }
         });
@@ -185,7 +190,7 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
       const handleResize = () => renderChart();
       window.addEventListener('resize', handleResize);
       return () => window.removeEventListener('resize', handleResize);
-    }, [points, range, isTall]);
+    }, [points, range, isTall, pollIntervalSeconds]);
 
     const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
       const cv = canvasRef.current;
@@ -215,8 +220,8 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
 
       setTooltip({
         visible: true,
-        x: best.x,
-        y: e.clientY - rect.top - 4,
+        x: Math.max(100, Math.min(rect.width - 100, best.x)),
+        y: Math.max(80, e.clientY - rect.top - 4),
         t: best.t,
         inVal: best.in,
         outVal: best.out,
@@ -231,6 +236,8 @@ export const TrafficCanvas = forwardRef<TrafficCanvasRef, TrafficCanvasProps>(
       <div className={`chart-wrap ${isTall ? 'tall' : ''}`} ref={containerRef}>
         <canvas
           ref={canvasRef}
+          role="img"
+          aria-label="กราฟทราฟฟิกรับและส่ง หน่วยบิตต่อวินาที"
           onMouseMove={handleMouseMove}
           onMouseLeave={handleMouseLeave}
           style={{ width: '100%', height: isTall ? '336px' : '296px' }}

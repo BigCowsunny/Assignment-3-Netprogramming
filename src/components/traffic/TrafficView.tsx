@@ -3,7 +3,7 @@ import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { TrafficCanvas, TrafficCanvasRef } from '../common/TrafficCanvas';
 import { calculateStats, TIME_RANGES } from '../../utils/trafficGenerator';
-import { fmtRate, fmtSpeed } from '../../utils/formatters';
+import { fmtFull, fmtPercent, fmtRate, fmtSpeed } from '../../utils/formatters';
 import { TimeRange } from '../../types/snmp';
 import { fetchTrafficDataApi } from '../../services/api';
 
@@ -16,15 +16,20 @@ export const TrafficView: React.FC = () => {
     setView,
     setPortAdmin,
     addToast,
+    pollIntervalSeconds,
   } = useSnmp();
 
   const chartRef = useRef<TrafficCanvasRef | null>(null);
   const [points, setPoints] = useState<{ t: number; in: number | null; out: number | null }[]>([]);
   const [trafficError, setTrafficError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!activeDevice || !activePort) return;
     let active = true;
+    setPoints([]);
+    setTrafficError('');
+    setLoading(true);
     const load = async () => {
       try {
         const rows = await fetchTrafficDataApi(activeDevice.id, activePort.name, timeRange);
@@ -35,12 +40,14 @@ export const TrafficView: React.FC = () => {
         if (!active) return;
         setPoints([]);
         setTrafficError(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (active) setLoading(false);
       }
     };
     void load();
-    const refresh = window.setInterval(() => { void load(); }, timeRange === 'live' ? 10_000 : 60_000);
+    const refresh = window.setInterval(() => { void load(); }, pollIntervalSeconds * 1000);
     return () => { active = false; window.clearInterval(refresh); };
-  }, [activeDevice?.id, activePort?.name, timeRange]);
+  }, [activeDevice?.id, activePort?.name, timeRange, pollIntervalSeconds]);
 
   const statsIn = useMemo(() => calculateStats(points, 'in'), [points]);
   const statsOut = useMemo(() => calculateStats(points, 'out'), [points]);
@@ -60,7 +67,8 @@ export const TrafficView: React.FC = () => {
   const isAdminUp = activePort.admin === 'up';
 
   const capacity = activePort.speed * 1e6;
-  const currentUtil = statsIn ? Math.round((statsIn.cur / capacity) * 100) : 0;
+  const currentUtil = fmtPercent(statsIn && capacity > 0 ? statsIn.cur / capacity * 100 : null);
+  const unknown = activePort.admin === 'unknown' || activePort.oper === 'unknown';
 
   const handleExportCSV = () => {
     let csv = 'timestamp,in_bps,out_bps\n';
@@ -109,7 +117,7 @@ export const TrafficView: React.FC = () => {
   ];
 
   return (
-    <section className="view active">
+    <section className="view active traffic-view">
       <div className="back-row">
         <button className="btn btn-ghost" onClick={() => setView('device')}>
           <Icon name="i-back" />
@@ -121,9 +129,9 @@ export const TrafficView: React.FC = () => {
         <div>
           <h1>
             <span>{activePort.name}</span>{' '}
-            <span className={`pill ${isUp ? 'ok' : 'bad'}`}>
+            <span className={`pill ${unknown ? 'off' : isUp ? 'ok' : 'bad'}`}>
               <i></i>
-              {isUp ? 'up' : 'down'}
+              {unknown ? 'Unknown' : isUp ? 'Link up' : 'Link down'}
             </span>
           </h1>
           <p className="mono">
@@ -133,42 +141,32 @@ export const TrafficView: React.FC = () => {
         </div>
 
         <div className="hero-stats">
-          <span className="pill off">Utilization {currentUtil}%</span>
-          <span className="pill off">Errors {activePort.errors} / 0</span>
-
-          <div className="seg" role="group" aria-label="ช่วงเวลา">
-            {ranges.map((r) => (
-              <button
-                key={r.key}
-                className={timeRange === r.key ? 'on' : ''}
-                onClick={() => setTimeRange(r.key)}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
-
-          <button className="btn" onClick={handleExportCSV}>
+          <button className="btn" onClick={handleExportCSV} disabled={loading || !points.some(p => p.in != null || p.out != null)}>
             <Icon name="i-download" />
             CSV
           </button>
-          <button className="btn" onClick={handleExportPNG}>
+          <button className="btn" onClick={handleExportPNG} disabled={loading}>
             <Icon name="i-image" />
             PNG
           </button>
 
           <button
-            className={`btn btn-icon ${isAdminUp ? 'btn-success' : 'btn-danger'}`}
+            className={`btn ${isAdminUp ? 'btn-danger' : 'btn-success'}`}
             title={isAdminUp ? `Shutdown พอร์ต ${activePort.name}` : `No Shutdown พอร์ต ${activePort.name}`}
             aria-label={isAdminUp ? 'ปิดพอร์ต (Shutdown)' : 'เปิดพอร์ต (No Shutdown)'}
             onClick={() => setPortAdmin(activeDevice.id, activePort.name, isAdminUp)}
           >
-            <Icon name={isAdminUp ? 'i-circle-check' : 'i-ban'} />
+            <Icon name={isAdminUp ? 'i-ban' : 'i-circle-check'} />
+            {isAdminUp ? 'ปิดพอร์ต' : 'เปิดพอร์ต'}
           </button>
         </div>
       </div>
 
       <div className="card">
+        <div className="traffic-toolbar">
+          <div className="seg" role="group" aria-label="ช่วงเวลา">{ranges.map(r => <button key={r.key} className={timeRange === r.key ? 'on' : ''} aria-pressed={timeRange === r.key} onClick={() => setTimeRange(r.key)}>{r.label}</button>)}</div>
+          <div className="traffic-meta"><span>In utilization <b>{currentUtil}</b></span><span>Errors <b>{activePort.errors}</b></span></div>
+        </div>
         <div className="card-head">
           <h3>
             ทราฟฟิก{' '}
@@ -184,13 +182,16 @@ export const TrafficView: React.FC = () => {
           </div>
         </div>
         <div className="card-body">
-          {trafficError && <p className="hint">โหลดข้อมูลทราฟฟิกไม่สำเร็จ: {trafficError}</p>}
+          {loading && <p className="hint" role="status">กำลังโหลดข้อมูลทราฟฟิก…</p>}
+          {trafficError && <div className="notice warning" role="alert">โหลดข้อมูลทราฟฟิกไม่สำเร็จ: {trafficError}</div>}
           <TrafficCanvas
             ref={chartRef}
             points={points}
             range={timeRange}
+            pollIntervalSeconds={pollIntervalSeconds}
             isTall={true}
           />
+          {!!points.length && <p className="hint">Sample ล่าสุด {fmtFull(points[points.length - 1].t)}</p>}
         </div>
       </div>
 

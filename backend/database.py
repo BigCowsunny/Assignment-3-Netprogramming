@@ -16,6 +16,30 @@ from typing import List, Dict, Any, Optional
 DB_PATH = os.path.join(os.path.dirname(__file__), "snmp_monitor.db")
 
 
+def get_poll_interval() -> int:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'poll_interval'").fetchone()
+        value = int(row["value"]) if row else 60
+        return value if 10 <= value <= 3600 else 60
+    except (TypeError, ValueError):
+        return 60
+    finally:
+        conn.close()
+
+
+def save_poll_interval(seconds: int):
+    if type(seconds) is not int or not 10 <= seconds <= 3600:
+        raise ValueError("poll_interval must be an integer between 10 and 3600")
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO app_settings (key, value) VALUES ('poll_interval', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(seconds),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row

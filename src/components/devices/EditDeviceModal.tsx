@@ -3,6 +3,7 @@ import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { Device, DeviceType, SnmpVersion } from '../../types/snmp';
 import { testConnectionApi } from '../../services/api';
+import { useDeviceDialog } from './useDeviceDialog';
 
 interface EditDeviceModalProps {
   device: Device | null;
@@ -26,10 +27,10 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
   const [version, setVersion] = useState<SnmpVersion>('v2c');
   const [community, setCommunity] = useState('public');
   const [snmpPort, setSnmpPort] = useState('161');
-  const [status, setStatus] = useState<'online' | 'offline'>('online');
 
   const [isTesting, setIsTesting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const dialog = useDeviceDialog(isOpen && !!device, onClose, device?.discovery_only ? '#ed-ip' : '#ed-name');
   const [testResult, setTestResult] = useState<{
     status: 'ok' | 'err';
     message: string;
@@ -45,7 +46,6 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       setVersion(device.ver);
       setCommunity(device.community || 'public');
       setSnmpPort(String(device.snmp_port || device.port || 161));
-      setStatus(device.status === 'offline' ? 'offline' : 'online');
       setTestResult(null);
     }
   }, [device, isOpen]);
@@ -109,7 +109,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       community,
       snmp_port: Number(snmpPort),
       port: Number(snmpPort),
-      status,
+      status: device.status,
     };
 
     setIsSaving(true);
@@ -122,26 +122,28 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" onClick={onClose}>
       <div
+        ref={dialog}
         className="sheet"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
+        aria-labelledby="edit-device-title"
       >
         <div className="sheet-head">
           <div>
-            <h2>แก้ไขอุปกรณ์</h2>
-            <p>ปรับปรุงข้อมูลอุปกรณ์และการตั้งค่า SNMP (FR-1.4)</p>
+            <h2 id="edit-device-title">{device.discovery_only ? 'ตั้งค่า IP / SNMP' : 'แก้ไขอุปกรณ์'}</h2>
+            <p>ข้อมูลอุปกรณ์และการเชื่อมต่อ SNMP</p>
           </div>
           <button className="icon-btn" onClick={onClose} aria-label="ปิด">
-            <Icon name="i-close" />
+            <Icon name="i-x" />
           </button>
         </div>
 
         <div className="sheet-body">
-          {device.discovery_only && <p className="hint">{device.config_unavailable_reason} · ใส่ Management IP และ community เพื่อยืนยัน SNMP ก่อนใช้งาน</p>}
-          <div className="field">
+          {device.discovery_only && <div className="notice warning">{device.config_unavailable_reason} · ใส่ Management IP และ community เพื่อยืนยัน SNMP ก่อนใช้งาน</div>}
+          <div className="fgrid"><div className="field">
             <label htmlFor="ed-name">ชื่ออุปกรณ์ (sysName)</label>
             <input
               id="ed-name"
@@ -168,7 +170,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             )}
           </div>
 
-          <div className="fgrid">
+          </div><div className="fgrid">
             <div className="field">
               <label htmlFor="ed-type">ประเภทอุปกรณ์</label>
               <select
@@ -182,15 +184,12 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             </div>
 
             <div className="field">
-              <label htmlFor="ed-status">สถานะ</label>
-              <select
-                id="ed-status"
-                value={status}
-                onChange={(e) => setStatus(e.target.value as 'online' | 'offline')}
-              >
-                <option value="online">ออนไลน์ (Online)</option>
-                <option value="offline">ออฟไลน์ (Offline)</option>
-              </select>
+              <span className="device-field-label">สถานะจากการ Monitor</span>
+              <div className="device-dialog-status">
+                <span className={'pill ' + (device.discovery_only || device.status === 'discovered' ? 'warn' : device.status === 'online' ? 'ok' : 'bad')}>
+                  <i aria-hidden="true" />{device.discovery_only || device.status === 'discovered' ? 'พบผ่าน CDP/LLDP' : device.status === 'online' ? 'ออนไลน์' : 'ออฟไลน์'}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -205,7 +204,7 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             </div>
           </div>}
 
-          <div className="field">
+          <div className="fgrid"><div className="field">
             <label htmlFor="ed-vendor">รุ่น / Vendor</label>
             <input
               id="ed-vendor"
@@ -216,7 +215,6 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             />
           </div>
 
-          <div className="fgrid">
             <div className="field">
               <label htmlFor="ed-ver">SNMP Version</label>
               <select
@@ -253,14 +251,14 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
             ยกเลิก
           </button>
           <button
-            className={`btn ${isTesting ? 'spinning' : ''}`}
+            className="btn"
             onClick={handleTestConnection}
-            disabled={isTesting || isSaving}
+            disabled={isTesting || isSaving || !ip.trim() || !community.trim()}
           >
-            <Icon name="i-refresh" />
+            <Icon name="i-refresh" className={isTesting ? 'ic spinning' : 'ic'} />
             Test Connection
           </button>
-          <button className="btn btn-primary" onClick={handleSave} disabled={isSaving || isTesting}>
+          <button className="btn btn-primary" onClick={handleSave} disabled={isSaving || isTesting || !ip.trim() || (ip !== 'Serial (COM)' && !community.trim())}>
             {isSaving ? 'กำลังยืนยัน SNMP…' : 'บันทึกการแก้ไข'}
           </button>
         </div>

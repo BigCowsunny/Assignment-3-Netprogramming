@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { useLatestTraffic } from '../../hooks/useLatestTraffic';
-import { fmtRate, shortN } from '../../utils/formatters';
+import { fmtRate, fmtPercent, shortN } from '../../utils/formatters';
 
 interface TalkerItem {
   deviceId: string;
@@ -46,7 +46,7 @@ export const TopTalkersCard: React.FC = () => {
   return (
     <div className="card mt12">
       <div className="card-head">
-        <h3>Port ที่ใช้ทราฟฟิกสูงสุด · ค่าล่าสุดจาก SNMP</h3>
+        <h3>พอร์ตที่ใช้งานสูงสุด</h3>
         <div className="legend-row">
           <span>
             <i className="k-warn"></i>≥ 40%
@@ -61,7 +61,7 @@ export const TopTalkersCard: React.FC = () => {
         <div
           className="tt"
           role="group"
-          aria-label="อันดับ Port ที่ใช้ทราฟฟิกสูงสุด 24 ชั่วโมง"
+          aria-label="อันดับพอร์ตตาม Utilization ล่าสุดจาก SNMP"
         >
           {talkers.length ? (
             talkers.map((r, i) => {
@@ -85,13 +85,13 @@ export const TopTalkersCard: React.FC = () => {
                     ></i>
                   </span>
                   <span className="tt-val">
-                    {Math.round(r.utilPercent)}% · {fmtRate(r.rate)}
+                    {fmtPercent(r.utilPercent)} · {fmtRate(r.rate)}
                   </span>
                 </button>
               );
             })
           ) : (
-            <div className="empty">ยังไม่มีข้อมูลทราฟฟิกในช่วง 24 ชั่วโมง</div>
+            <div className="empty"><b>ยังไม่มีพอร์ตที่มีทราฟฟิก</b><p>อันดับจะปรากฏเมื่อได้รับค่า SNMP ล่าสุด</p></div>
           )}
         </div>
       </div>

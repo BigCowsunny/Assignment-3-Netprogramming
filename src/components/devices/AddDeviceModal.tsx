@@ -3,6 +3,7 @@ import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { Device, DeviceType, SnmpVersion } from '../../types/snmp';
 import { createDeviceApi, testConnectionApi } from '../../services/api';
+import { useDeviceDialog } from './useDeviceDialog';
 
 interface AddDeviceModalProps {
   isOpen: boolean;
@@ -28,6 +29,7 @@ export const AddDeviceModal: React.FC<AddDeviceModalProps> = ({ isOpen, onClose 
     details?: string;
   } | null>(null);
   const [testedIp, setTestedIp] = useState<string | null>(null);
+  const dialog = useDeviceDialog(isOpen, onClose, '#ad-ip');
 
   if (!isOpen) return null;
 
@@ -64,7 +66,7 @@ export const AddDeviceModal: React.FC<AddDeviceModalProps> = ({ isOpen, onClose 
       setTestedIp(result.status === 'ok' ? probeSignature(trimmedIp) : null);
     } catch (error) {
       setTestedIp(null);
-      setTestResult({ status: 'err', message: 'เชื่อมต่อ Backend ไม่สำเร็จ', details: error instanceof Error ? error.message : String(error) });
+      setTestResult({ status: 'err', message: 'ไม่สามารถเชื่อมต่อบริการระบบได้', details: error instanceof Error ? error.message : String(error) });
     } finally {
       setIsTesting(false);
     }
@@ -87,9 +89,9 @@ export const AddDeviceModal: React.FC<AddDeviceModalProps> = ({ isOpen, onClose 
 
   return (
     <div className="modal" onClick={onClose}>
-      <div className="sheet" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+      <div ref={dialog} className="sheet" role="dialog" aria-modal="true" aria-labelledby="add-device-title" onClick={(e) => e.stopPropagation()}>
         <div className="sheet-head">
-          <h2>เพิ่มอุปกรณ์ใหม่</h2>
+          <h2 id="add-device-title">เพิ่มอุปกรณ์ใหม่</h2>
           <button className="icon-btn" onClick={onClose} aria-label="ปิด">
             <Icon name="i-x" />
           </button>
@@ -170,7 +172,7 @@ export const AddDeviceModal: React.FC<AddDeviceModalProps> = ({ isOpen, onClose 
           </div>
 
           <p className="hint">
-            ใช้ IP สำหรับจัดการอุปกรณ์ที่ backend เข้าถึงได้ (EVE-NG ให้ใช้ management IP ของ node) · ต้องเปิด SNMP v2c และอนุญาต community นี้
+            ระบุ Management IP ที่ระบบเข้าถึงได้ สำหรับ EVE-NG ใช้ IP ของอุปกรณ์ภายใน Lab · เปิด SNMP v2c และกำหนดสิทธิ์ให้ community นี้
           </p>
 
           {isTesting && (
@@ -196,11 +198,11 @@ export const AddDeviceModal: React.FC<AddDeviceModalProps> = ({ isOpen, onClose 
             ยกเลิก
           </button>
           <button
-            className={`btn ${isTesting ? 'spinning' : ''}`}
+            className="btn"
             onClick={handleTestConnection}
-            disabled={isTesting}
+            disabled={isTesting || !ip.trim() || !community.trim()}
           >
-            <Icon name="i-refresh" />
+            <Icon name="i-refresh" className={isTesting ? 'ic spinning' : 'ic'} />
             Test Connection
           </button>
           <button

@@ -32,7 +32,7 @@ from database import (
 )
 from snmp_engine import snmp_get_system_info, snmp_set_admin_status, snmp_walk_interfaces
 from trap_receiver import start_trap_listener, ws_manager
-from poller import run_poller_loop
+from poller import run_poller_loop, configure_poll_interval, get_runtime_poll_interval
 from cdp_receiver import cdp_capture
 from discovery_jobs import discovery_jobs
 
@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI):
         _trap_port = int(_trap_transport.get_extra_info("sockname")[1])
 
     logger.info("Starting Background SNMP Poller...")
-    _poller_task = asyncio.create_task(run_poller_loop(poll_interval_seconds=60))
+    configure_poll_interval(database.get_poll_interval())
+    _poller_task = asyncio.create_task(run_poller_loop(poll_interval_seconds=get_runtime_poll_interval()))
     _topology_task = asyncio.create_task(discovery_jobs.periodic())
 
     yield
@@ -118,6 +119,10 @@ class InterfaceAdminRequest(BaseModel):
     status: str  # "up" or "down"
 
 
+class PollingSettingsRequest(BaseModel):
+    poll_interval: int = Field(strict=True, ge=10, le=3600)
+
+
 class DiscoveryRequest(BaseModel):
     seed_ip: Optional[str] = ""
     community: str = ""
@@ -135,10 +140,26 @@ async def health_check():
         "status": "online",
         "service": "SNMP Network Monitor Backend",
         "trap_port": _trap_port,
-        "poller": "active",
+        "poller": "active" if _poller_task and not _poller_task.done() else "inactive",
+        "poll_interval": get_runtime_poll_interval(),
         "cdp": cdp_capture.health(),
         "timestamp": time.time()
     }
+
+
+@app.get("/api/settings/polling")
+async def get_polling_settings():
+    return {"poll_interval": get_runtime_poll_interval(), "min_seconds": 10, "max_seconds": 3600}
+
+
+@app.put("/api/settings/polling")
+async def update_polling_settings(req: PollingSettingsRequest):
+    previous = get_runtime_poll_interval()
+    database.save_poll_interval(req.poll_interval)
+    configure_poll_interval(req.poll_interval)
+    if previous != req.poll_interval:
+        add_audit_log("admin", "ปรับรอบการอ่านข้อมูล SNMP", f"{previous} → {req.poll_interval} วินาที", "สำเร็จ")
+    return {"poll_interval": get_runtime_poll_interval(), "min_seconds": 10, "max_seconds": 3600}
 
 
 @app.get("/api/discovery/cdp/status")

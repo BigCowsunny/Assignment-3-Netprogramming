@@ -1,6 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
+import { CiscoDeviceIcon } from '../common/CiscoDeviceIcon';
 import { TopologyConnections } from './TopologyConnections';
 
 export const TopologyView: React.FC = () => {
@@ -16,11 +17,6 @@ export const TopologyView: React.FC = () => {
     openDevice,
   } = useSnmp();
 
-  console.log('🗺️ TopologyView render:');
-  console.log('  - devices:', devices.length, devices.map(d => d.id + ':' + d.name));
-  console.log('  - topologyPos:', Object.keys(topologyPos).length, topologyPos);
-  console.log('  - topologyLinks:', topologyLinks.length);
-
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [network, setNetwork] = useState('');
@@ -35,8 +31,8 @@ export const TopologyView: React.FC = () => {
 
   const handleDiscover = async () => {
     setIsDiscovering(true);
-    await runDiscovery({ network, communities });
-    setIsDiscovering(false);
+    try { await runDiscovery({ network, communities }); }
+    finally { setIsDiscovering(false); }
   };
 
   const getSvgCoordinates = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -46,7 +42,10 @@ export const TopologyView: React.FC = () => {
     pt.x = e.clientX;
     pt.y = e.clientY;
     const transformed = pt.matrixTransform(svg.getScreenCTM()?.inverse());
-    return { x: transformed.x, y: transformed.y };
+    return {
+      x: (transformed.x - 440 * (1 - topologyZoom)) / topologyZoom,
+      y: (transformed.y - 235 * (1 - topologyZoom)) / topologyZoom,
+    };
   };
 
   const handlePointerDown = (
@@ -103,50 +102,49 @@ export const TopologyView: React.FC = () => {
   const transformStyle = `translate(${440 * (1 - topologyZoom)}, ${235 * (1 - topologyZoom)}) scale(${topologyZoom})`;
 
   return (
-    <section className="view active">
+    <section className="view active topology-view">
       <div className="page-head">
         <div>
           <h1>โทโพโลยี</h1>
           <p>ค้นหาและไล่เพื่อนบ้านผ่าน CDP/LLDP และ SNMP</p>
         </div>
 
-        <div className="hero-stats">
-          {isDiscovering && (
-            <div className="prog">
-              <i style={{ width: `${discoveryProgress ? Math.round(100 * discoveryProgress.checked / Math.max(1, discoveryProgress.checked + discoveryProgress.queued)) : 0}%` }}></i>
-            </div>
-          )}
-          <div className="toolbar" style={{ marginBottom: 0 }}>
-            <input aria-label="IP เริ่มต้น หรือ subnet (ไม่บังคับ)" value={network} onChange={(e) => setNetwork(e.target.value)} placeholder="IP / subnet · ว่าง = อุปกรณ์ที่พบแล้ว" disabled={isDiscovering} />
-            <input aria-label="SNMP communities" value={communities} onChange={(e) => setCommunities(e.target.value)} placeholder="SNMP communities คั่นด้วย comma" disabled={isDiscovering} />
+        <span className="pill off">{devices.length} อุปกรณ์</span>
+      </div>
+      <div className="card discovery-card"><div className="card-body">
+        <div className="discovery-fields">
+            <div className="field"><label htmlFor="discovery-seed">IP เริ่มต้น / Subnet <span className="hint">(ไม่บังคับ)</span></label><input id="discovery-seed" value={network} onChange={(e) => setNetwork(e.target.value)} placeholder="เว้นว่างเพื่อเริ่มจากอุปกรณ์ที่พบแล้ว" disabled={isDiscovering} /></div>
+            <div className="field"><label htmlFor="discovery-community">SNMP communities <span className="hint">(ไม่บังคับ)</span></label><input id="discovery-community" type="password" autoComplete="off" value={communities} onChange={(e) => setCommunities(e.target.value)} placeholder="ใช้ค่าที่บันทึกไว้ หรือระบุคั่นด้วย comma" disabled={isDiscovering} /></div>
             <button
               className="btn btn-primary"
               onClick={handleDiscover}
               disabled={isDiscovering}
             >
               <Icon name="i-radar" />
-              Discover
+              {isDiscovering ? 'กำลังค้นหา…' : 'Discover'}
             </button>
-          </div>
         </div>
-      </div>
 
-      <p className="hint" role="status">
+      <p className="discovery-status" role="status">
         {!discoveryProgress ? 'ไม่ต้องระบุ subnet · ใช้ IP ที่พบผ่าน CDP/LLDP หรืออุปกรณ์ที่เพิ่มไว้ และ SNMP community ที่บันทึกไว้' :
           `${({ starting: 'เริ่มค้นหา', scanning: 'สแกน subnet', probing: 'ตรวจ SNMP', reading_interfaces: 'อ่านพอร์ต', reading_neighbors: 'อ่านเพื่อนบ้าน', completed: 'ค้นหาเสร็จแล้ว', failed: 'ค้นหาล้มเหลว', cancelled: 'ยกเลิกแล้ว' } as Record<string, string>)[discoveryProgress.phase] || discoveryProgress.phase} ${discoveryProgress.current_name || discoveryProgress.current_ip} · ตรวจแล้ว ${discoveryProgress.checked} · พบ ${discoveryProgress.devices_count} nodes / ${discoveryProgress.links_count} neighbor links`}
       </p>
       {discoveryProgress?.error && <p className="hint" role="alert">{discoveryProgress.error}</p>}
-      {!!discoveryProgress?.issues?.length && <details className="hint" open={discoveryProgress.status !== 'running'}>
+      {!!discoveryProgress?.issues?.length && <details className="discovery-issues">
         <summary>ข้อจำกัดที่พบ ({discoveryProgress.issues.length})</summary>
         <ul>{discoveryProgress.issues.map((issue, index) => <li key={index}>{issue.name || issue.ip || 'Discovery'}: {issue.message}</li>)}</ul>
       </details>}
+      </div></div>
+      <div className="card topology-card"><div className="card-head"><h3>Network topology</h3><div className="topology-legend"><span><i className="status-dot up"/>Up</span><span><i className="status-dot down"/>Down</span><span><i className="status-dot unknown"/>Unknown</span><span>ลากเพื่อจัดตำแหน่ง · คลิกเพื่อดูพอร์ต</span></div></div>
       <div className="topo-wrap">
+        {!devices.length && <div className="empty"><b>ยังไม่มีอุปกรณ์ในแผนภาพ</b><p>เพิ่มอุปกรณ์หรือกด Discover เพื่อเริ่มค้นหา</p></div>}
         <svg
           id="topo"
           ref={svgRef}
+          style={!devices.length ? {display:'none'} : undefined}
           viewBox="0 0 880 470"
           preserveAspectRatio="xMidYMid meet"
-          role="img"
+          role="group"
           aria-label="แผนภาพโทโพโลยีเครือข่าย"
           className={dragState ? 'dragging' : ''}
           onPointerMove={handlePointerMove}
@@ -168,10 +166,15 @@ export const TopologyView: React.FC = () => {
                   className={`node ${isOnline || d.status === 'discovered' ? '' : 'off'}`}
                   transform={`translate(${pos.x},${pos.y})`}
                   onPointerDown={(e) => handlePointerDown(e, d.id)}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={'ดูพอร์ต ' + d.name}
+                  onKeyDown={e => { if(e.key === 'Enter' || e.key === ' ') {e.preventDefault();openDevice(d.id);} }}
                 >
-                  {/* Icon only - no box background */}
+                  <title>{d.name + ' · ' + (d.ip || 'ไม่มี IP · Config ไม่ได้')}</title>
+                  <rect className="node-surface" x="-32" y="-32" width="64" height="64" rx="12" />
                   <g transform="translate(-30, -30)">
-                    <Icon name={d.type === 'switch' ? 'i-switch' : 'i-router'} size={60} />
+                    <CiscoDeviceIcon deviceType={d.type} size={60} />
                   </g>
                   
                   {/* Device name below icon */}
@@ -206,9 +209,10 @@ export const TopologyView: React.FC = () => {
           </button>
         </div>
       </div>
+      </div>
 
       <p className="hint mt12">
-        เส้นเขียว = link up · เส้นประ = พบผ่าน CDP/LLDP ยังไม่ทราบสถานะ · เส้นแดง = link down (อัปเดตทันทีเมื่อได้รับ Trap) · ป้ายแสดง Port · จุดเครือข่ายร่วมรวม neighbor บนพอร์ตเดียวกัน
+        สายอ้างอิง CDP/LLDP และชื่อพอร์ต · เส้นประ = ยังไม่ทราบสถานะ · จุดเครือข่ายร่วม = อนุมานจาก neighbor หลายตัวบนพอร์ตเดียวกัน
       </p>
     </section>
   );

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { fetchLatestTrafficApi } from '../services/api';
+import { useSnmp } from '../context/SnmpContext';
 
 export interface LatestTraffic {
   device_id: string;
@@ -10,6 +11,7 @@ export interface LatestTraffic {
 }
 
 export function useLatestTraffic(): LatestTraffic[] {
+  const { pollIntervalSeconds } = useSnmp();
   const [rows, setRows] = useState<LatestTraffic[]>([]);
   useEffect(() => {
     let active = true;
@@ -22,8 +24,8 @@ export function useLatestTraffic(): LatestTraffic[] {
       }
     };
     void load();
-    const timer = window.setInterval(() => { void load(); }, 60_000);
+    const timer = window.setInterval(() => { void load(); }, pollIntervalSeconds * 1000);
     return () => { active = false; window.clearInterval(timer); };
-  }, []);
+  }, [pollIntervalSeconds]);
   return rows;
 }

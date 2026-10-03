@@ -23,6 +23,22 @@ logger = logging.getLogger("poller")
 # Memory cache for previous counter samples:
 # {(device_id, if_index): (timestamp, in_octets, out_octets)}
 _prev_counters: Dict[Tuple[str, int], Tuple[float, int, int]] = {}
+_poll_interval_seconds = 60
+_interval_changed = asyncio.Event()
+
+
+def get_runtime_poll_interval() -> int:
+    return _poll_interval_seconds
+
+
+def configure_poll_interval(seconds: int):
+    global _poll_interval_seconds
+    if type(seconds) is not int or not 10 <= seconds <= 3600:
+        raise ValueError("poll_interval must be an integer between 10 and 3600")
+    if seconds != _poll_interval_seconds:
+        _poll_interval_seconds = seconds
+        _interval_changed.set()
+        logger.info("SNMP polling interval changed to %ss", seconds)
 
 
 async def poll_device_metrics(device: dict):
@@ -132,6 +148,7 @@ async def poll_device_metrics(device: dict):
 
 async def run_poller_loop(poll_interval_seconds: int = 60):
     """Periodic polling worker task"""
+    configure_poll_interval(poll_interval_seconds)
     logger.info(f"Starting SNMP Poller loop (interval={poll_interval_seconds}s)")
     while True:
         try:
@@ -142,4 +159,15 @@ async def run_poller_loop(poll_interval_seconds: int = 60):
         except Exception as e:
             logger.error(f"Error in poller loop: {e}")
 
-        await asyncio.sleep(poll_interval_seconds)
+        # Reschedule from the last completed round without cancelling an SNMP read.
+        # Waking the wait also applies a shorter interval immediately.
+        completed_at = asyncio.get_running_loop().time()
+        while True:
+            _interval_changed.clear()
+            delay = completed_at + _poll_interval_seconds - asyncio.get_running_loop().time()
+            if delay <= 0:
+                break
+            try:
+                await asyncio.wait_for(_interval_changed.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                break

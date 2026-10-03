@@ -8,9 +8,16 @@ const WS_BASE_URL = 'ws://localhost:8000/ws/events';
 export interface BackendHealth {
   status: string;
   service: string;
-  trap_port: number;
+  trap_port: number | null;
   poller: string;
+  poll_interval: number;
   timestamp: number;
+}
+
+export async function fetchBackendHealth(): Promise<BackendHealth> {
+  const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(3000) });
+  if (!res.ok) throw new Error('ไม่สามารถตรวจสอบสถานะบริการระบบได้');
+  return res.json();
 }
 
 export async function checkBackendHealth(): Promise<boolean> {
@@ -22,6 +29,19 @@ export async function checkBackendHealth(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function savePollingSettingsApi(pollInterval: number): Promise<{ poll_interval: number }> {
+  const res = await fetch(`${API_BASE_URL}/settings/polling`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ poll_interval: pollInterval }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(res.status === 422
+    ? 'กรุณาระบุจำนวนเต็มระหว่าง 10–3,600 วินาที'
+    : 'บันทึกรอบการอ่านข้อมูลไม่สำเร็จ กรุณาตรวจสอบการเชื่อมต่อบริการระบบ');
+  return res.json();
 }
 
 export async function fetchDevicesApi() {

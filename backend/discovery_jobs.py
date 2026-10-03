@@ -47,7 +47,7 @@ class DiscoveryJobs:
             raise
         except Exception:
             # Exceptions may contain transport details. Do not publish credential-bearing strings.
-            state.update(status="failed", phase="failed", error="Discovery ล้มเหลว; ตรวจ log ของ backend", finished_at=time.time())
+            state.update(status="failed", phase="failed", error="ค้นหาอุปกรณ์ไม่สำเร็จ โปรดตรวจสอบบันทึกข้อผิดพลาดของบริการค้นหาอุปกรณ์", finished_at=time.time())
             import logging
             logging.getLogger("discovery_jobs").exception("Discovery job failed")
 

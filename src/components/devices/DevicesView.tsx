@@ -1,6 +1,11 @@
 import React, { useState } from 'react';
+import { ArrowUp, ArrowDown } from 'lucide-react';
+import { DeviceActionMenu } from './DeviceActionMenu';
+import './devices.css';
+import { useDeviceDialog } from './useDeviceDialog';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
+import { CiscoDeviceIcon } from '../common/CiscoDeviceIcon';
 import { AddDeviceModal } from './AddDeviceModal';
 import { EditDeviceModal } from './EditDeviceModal';
 import { Device } from '../../types/snmp';
@@ -33,6 +38,7 @@ export const DevicesView: React.FC = () => {
   const [showEveNGModal, setShowEveNGModal] = useState(false);
   const [scanNetworkCidr, setScanNetworkCidr] = useState('192.168.213.0/24');
   const [scanCommunities, setScanCommunities] = useState('public,private');
+  const scanDialog = useDeviceDialog(showEveNGModal, () => setShowEveNGModal(false));
 
   const handleAutoScanAll = async () => {
     setScanning(true);
@@ -403,7 +409,7 @@ export const DevicesView: React.FC = () => {
     try {
       const status = await startCdpCaptureApi();
       if (status.status === 'unavailable' || status.status === 'disabled') {
-        addToast('bad', 'ยังตรวจจับ CDP/LLDP ไม่ได้', status.error || 'ตัวรับ CDP/LLDP ถูกปิดในการตั้งค่า Backend');
+        addToast('bad', 'ยังตรวจจับ CDP/LLDP ไม่ได้', status.error || 'บริการรับข้อมูล CDP/LLDP ยังไม่ได้เปิดใช้งาน');
       } else {
         addToast('', status.status === 'listening' ? 'กำลังรับ CDP/LLDP จากสายเครือข่าย' : 'กำลังเริ่มตัวรับ CDP/LLDP', 'รออุปกรณ์ส่ง CDP/LLDP; อุปกรณ์ที่ไม่มี IP จะแสดงพร้อมคำเตือนว่า Config ไม่ได้');
       }
@@ -437,179 +443,205 @@ export const DevicesView: React.FC = () => {
       );
       refreshDeviceData();
     } catch (error) {
-      addToast('bad', 'SNMP scan ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบ Backend และ network');
+      addToast('bad', 'SNMP scan ล้มเหลว', error instanceof Error ? error.message : 'ตรวจสอบสถานะบริการระบบและการเชื่อมต่อเครือข่าย');
     }
     setScanning(false);
   };
 
-  const filteredDevices = devices.filter((d) => {
+  const [sortAscending, setSortAscending] = useState(true);
+  const hasFilters = !!searchQuery.trim() || filterType !== 'all' || filterStatus !== 'all';
+  const clearFilters = () => {
+    setSearchQuery('');
+    setFilterType('all');
+    setFilterStatus('all');
+  };
+  const statusOf = (device: Device) => device.discovery_only ? 'discovered' : device.status;
+  const filteredDevices = devices.filter((device) => {
     const q = searchQuery.trim().toLowerCase();
-    const matchesSearch =
-      !q || d.name.toLowerCase().includes(q) || d.ip.includes(q);
-    const matchesType = filterType === 'all' || d.type === filterType;
-    const matchesStatus = filterStatus === 'all' || d.status === filterStatus;
-    return matchesSearch && matchesType && matchesStatus;
-  });
+    return (!q || device.name.toLowerCase().includes(q) || device.ip.toLowerCase().includes(q)) &&
+      (filterType === 'all' || device.type === filterType) &&
+      (filterStatus === 'all' || statusOf(device) === filterStatus);
+  }).sort((a, b) => (sortAscending ? 1 : -1) * a.name.localeCompare(b.name, 'th', { numeric: true }));
 
-  const getPortRatio = (d: (typeof devices)[0]) => {
-    if (d.discovery_only) return `${d.ports.length} พบผ่าน CDP/LLDP`;
-    const ps = d.ports.filter((p) => !p.virtual);
-    const u = ps.filter((p) => p.admin === 'up' && p.oper === 'up').length;
-    return `${u}/${ps.length}`;
+  const summary = [
+    { key: 'all', label: 'อุปกรณ์ทั้งหมด', count: devices.length, tone: 'neutral' },
+    { key: 'online', label: 'ออนไลน์', count: devices.filter((device) => statusOf(device) === 'online').length, tone: 'online' },
+    { key: 'offline', label: 'ออฟไลน์', count: devices.filter((device) => statusOf(device) === 'offline').length, tone: 'offline' },
+    { key: 'discovered', label: 'พบผ่าน CDP/LLDP', count: devices.filter((device) => statusOf(device) === 'discovered').length, tone: 'discovered' },
+  ];
+  const vendorLabel = (device: Device) => {
+    const vendor = device.vendor.trim();
+    return vendor.match(/^(Cisco|Juniper|Arista|MikroTik|Ubiquiti|Huawei|HPE|HP|Dell)\b/i)?.[0] || vendor;
   };
 
   return (
-    <section className="view active">
-      <div className="page-head">
+    <section className="view active devices-view">
+      <div className="page-head devices-page-head">
         <div>
           <h1>อุปกรณ์</h1>
-          <p>จัดการ Router/Switch ที่ลงทะเบียนไว้ในระบบ monitor</p>
+          <p>ติดตามสถานะและจัดการพอร์ตของ Router / Switch</p>
         </div>
-        <div style={{ display: 'flex', gap: '10px' }}>
-          <button className="btn btn-ghost" onClick={handleRefresh} disabled={scanning}>
+        <div className="devices-page-actions">
+          <button className="icon-btn device-refresh" onClick={handleRefresh} disabled={scanning}
+            aria-label="รีเฟรชอุปกรณ์" title="รีเฟรชอุปกรณ์">
             <Icon name="i-refresh" />
-            Refresh
           </button>
-          <button className="btn btn-ghost" onClick={() => setShowEveNGModal(true)} disabled={scanning}>
-            <Icon name="i-topo" />
-            Network Scan
+          <DeviceActionMenu label="วิธีค้นหาเพิ่มเติม" text="เพิ่มเติม" disabled={scanning} actions={[
+            { label: 'ตรวจจับ CDP/LLDP', icon: 'i-radar', description: 'รับประกาศจากอุปกรณ์ในเครือข่าย', onSelect: handleCdpCapture },
+            { label: 'เชื่อมต่อ COM Port', icon: 'i-server', description: 'ค้นหาอุปกรณ์ผ่านสาย Console', onSelect: handleScan },
+          ]} />
+          <button className="btn" onClick={() => setShowEveNGModal(true)} disabled={scanning}>
+            <Icon name="i-radar" />{scanning ? 'กำลังค้นหา…' : 'ค้นหาอุปกรณ์'}
           </button>
-          <button className="btn btn-ghost" onClick={handleScan} disabled={scanning}>
-            <Icon name="i-server" />
-            COM Port
-          </button>
-          <button className="btn btn-ghost" onClick={handleCdpCapture} disabled={scanning}>
-            <Icon name="i-radar" />
-            ตรวจจับ CDP/LLDP
-          </button>
-          <button className="btn btn-ghost" onClick={() => setIsAddModalOpen(true)}>
-            <Icon name="i-plus" />
-            เพิ่มด้วย IP
+          <button className="btn btn-primary" onClick={() => setIsAddModalOpen(true)}>
+            <Icon name="i-plus" />เพิ่มด้วย IP
           </button>
         </div>
       </div>
 
-      <div className="toolbar">
-        <label className="gsearch">
-          <Icon name="i-search" />
-          <input
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="ค้นหาชื่อ / IP"
-            aria-label="ค้นหา"
-          />
-        </label>
-
-        <select
-          value={filterType}
-          onChange={(e) => setFilterType(e.target.value)}
-          aria-label="กรองประเภท"
-        >
-          <option value="all">ประเภท: ทั้งหมด</option>
-          <option value="router">Router</option>
-          <option value="switch">Switch</option>
-        </select>
-
-        <select
-          value={filterStatus}
-          onChange={(e) => setFilterStatus(e.target.value)}
-          aria-label="กรองสถานะ"
-        >
-          <option value="all">สถานะ: ทั้งหมด</option>
-          <option value="online">ออนไลน์</option>
-          <option value="offline">ออฟไลน์</option>
-          <option value="discovered">พบผ่าน CDP/LLDP</option>
-        </select>
-
-        <span className="spacer"></span>
-        <span className="count">
-          แสดง {filteredDevices.length} / {devices.length} อุปกรณ์
-        </span>
+      <div className="device-status-summary" aria-label="สรุปสถานะอุปกรณ์">
+        {summary.map((item) => <button key={item.key}
+          className={'device-summary-item ' + item.tone + (filterStatus === item.key ? ' selected' : '')}
+          aria-pressed={filterStatus === item.key}
+          aria-label={item.label + ' ' + item.count + ' อุปกรณ์'}
+          onClick={() => setFilterStatus(item.key)}>
+          <span className="device-summary-label"><i aria-hidden="true" />{item.label}</span>
+          <strong>{item.count}<small>อุปกรณ์</small></strong>
+        </button>)}
       </div>
 
-      <div className="card">
-        <div className="tablewrap">
-          <table className="data">
+      <div className="card devices-inventory">
+        <div className="devices-list-heading">
+          <h2>รายการอุปกรณ์</h2>
+          <span aria-live="polite">แสดง <b>{filteredDevices.length}</b> จาก {devices.length} อุปกรณ์</span>
+        </div>
+        <div className="devices-filters">
+          <label className="device-search">
+            <Icon name="i-search" aria-hidden="true" />
+            <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="ค้นหาชื่ออุปกรณ์หรือ IP address" aria-label="ค้นหาชื่ออุปกรณ์หรือ IP" />
+            {searchQuery && <button className="icon-btn" aria-label="ล้างคำค้นหา" onClick={() => setSearchQuery('')}>
+              <Icon name="i-x" />
+            </button>}
+          </label>
+          <select value={filterType} onChange={(event) => setFilterType(event.target.value)} aria-label="กรองประเภท">
+            <option value="all">ประเภท: ทั้งหมด</option>
+            <option value="router">Router</option>
+            <option value="switch">Switch</option>
+          </select>
+          <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value)} aria-label="กรองสถานะ">
+            <option value="all">สถานะ: ทั้งหมด</option>
+            <option value="online">ออนไลน์</option>
+            <option value="offline">ออฟไลน์</option>
+            <option value="discovered">พบผ่าน CDP/LLDP</option>
+          </select>
+          {hasFilters && <button className="btn btn-ghost device-clear-filters" onClick={clearFilters}>
+            <Icon name="i-x" />ล้างตัวกรอง
+          </button>}
+        </div>
+
+        {!!filteredDevices.length && <div className="tablewrap">
+          <table className="data devices-table" aria-label="รายการอุปกรณ์เครือข่าย">
+            <colgroup>
+              <col className="device-col-name" />
+              <col className="device-col-status" />
+              <col className="device-col-ip" />
+              <col className="device-col-ports" />
+              <col className="device-col-uptime" />
+              <col className="device-col-actions" />
+            </colgroup>
             <thead>
               <tr>
-                <th>สถานะ</th>
-                <th>อุปกรณ์</th>
-                <th>ประเภท</th>
-                <th>รุ่น</th>
-                <th>Uptime</th>
-                <th>Port (up/total)</th>
-                <th>SNMP</th>
-                <th className="r">จัดการ</th>
+                <th scope="col" aria-sort={sortAscending ? 'ascending' : 'descending'}>
+                  <button className="device-sort" onClick={() => setSortAscending(!sortAscending)}
+                    title="สลับลำดับชื่ออุปกรณ์">
+                    อุปกรณ์{sortAscending ? <ArrowUp size={13} aria-hidden="true" /> : <ArrowDown size={13} aria-hidden="true" />}
+                  </button>
+                </th>
+                <th scope="col">สถานะ</th>
+                <th scope="col">IP / SNMP</th>
+                <th scope="col" title="พอร์ต Up / พอร์ตจริงทั้งหมด">Ports Up / Total</th>
+                <th scope="col" className="device-col-uptime">Uptime</th>
+                <th scope="col" className="r">จัดการ</th>
               </tr>
             </thead>
             <tbody>
-              {filteredDevices.length ? (
-                filteredDevices.map((d) => (
-                  <tr key={d.id}>
-                    <td>
-                      {d.status === 'online' ? (
-                        <span className="pill ok">
-                          <i></i>ออนไลน์
+              {filteredDevices.map((device) => {
+                const pending = statusOf(device) === 'discovered';
+                const physicalPorts = device.ports.filter((port) => !port.virtual);
+                const upPorts = physicalPorts.filter((port) => port.admin === 'up' && port.oper === 'up').length;
+                const warning = configurationWarning(device);
+                const statusClass = pending ? 'warn' : device.status === 'online' ? 'ok' : 'bad';
+                const uptime = device.up && device.up !== '—' ? device.up : '—';
+                return <tr key={device.id}>
+                  <td>
+                    <div className="device-identity">
+                      <span className={'device-type-icon ' + device.type} aria-hidden="true">
+                        <CiscoDeviceIcon deviceType={device.type} size={34} />
+                      </span>
+                      <div className="device-identity-copy">
+                        <button className="devlink device-name" title={device.name} onClick={() => openDevice(device.id)}>
+                          {device.name}
+                        </button>
+                        <span className="device-row-meta" title={device.vendor + (device.descr ? ' · ' + device.descr : '')}>
+                          {device.type === 'switch' ? 'Switch' : 'Router'}{vendorLabel(device) && ' · ' + vendorLabel(device)}
                         </span>
-                      ) : d.status === 'discovered' ? (
-                        <span className="pill warn"><i></i>พบผ่าน CDP/LLDP</span>
-                      ) : (
-                        <span className="pill bad">
-                          <i></i>ออฟไลน์
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      <button
-                        className="devlink"
-                        onClick={() => openDevice(d.id)}
-                      >
-                        {d.name}
-                      </button>
-                      <div className="sub">{d.ip || 'ไม่มี IP'}</div>
-                      {configurationWarning(d) && <div className="hint" role="status">{configurationWarning(d)}</div>}
-                    </td>
-                    <td>{d.type === 'switch' ? 'Switch' : 'Router'}</td>
-                    <td className="hint">{d.vendor}</td>
-                    <td className="mono">{d.up}</td>
-                    <td className="mono">{getPortRatio(d)}</td>
-                    <td className="mono">
-                      {d.discovery_only ? 'Config ไม่ได้' : `${d.ver} · SET ตรวจที่อุปกรณ์`}
-                    </td>
-                    <td className="r">
-                      <button
-                        className="btn btn-ghost"
-                        onClick={() => openDevice(d.id)}
-                      >
-                        ดูพอร์ต
-                      </button>{' '}
-                      <button
-                        className="btn btn-ghost"
-                        onClick={() => setEditingDevice(d)}
-                        title="แก้ไขอุปกรณ์"
-                      >
-                        <Icon name="i-set" />
-                        {d.discovery_only ? 'ตั้งค่า IP/SNMP' : 'แก้ไข'}
-                      </button>{' '}
-                      <button
-                        className="btn btn-ghost danger-txt"
-                        onClick={() => deleteDevice(d.id)}
-                      >
-                        <Icon name="i-trash" />
-                        ลบ
-                      </button>
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={8} className="empty">
-                    ไม่พบอุปกรณ์ที่ตรงกับตัวกรอง
+                      </div>
+                    </div>
                   </td>
-                </tr>
-              )}
+                  <td>
+                    <span className={'pill ' + statusClass}><i aria-hidden="true" />
+                      {pending ? 'พบผ่าน CDP/LLDP' : device.status === 'online' ? 'ออนไลน์' : 'ออฟไลน์'}
+                    </span>
+                    {warning && <span className="device-config-warning" title={warning} aria-label={warning}>
+                      <Icon name="i-triangle-alert" size={12} aria-hidden="true" />Config ไม่ได้
+                    </span>}
+                  </td>
+                  <td>
+                    <span className={device.ip ? 'device-address mono' : 'device-address missing-ip'}>{device.ip || 'ไม่มี IP'}</span>
+                    <span className="device-row-meta">
+                      {pending ? (device.discovery_protocol || 'CDP/LLDP') : device.ip === 'Serial (COM)' ? 'Console' : 'SNMP ' + device.ver}
+                    </span>
+                  </td>
+                  <td>
+                    {pending ? <><span className="device-port-count mono">{device.ports.length}<small> พอร์ต</small></span>
+                      <span className="device-row-meta">จาก {device.discovery_protocol || 'neighbor'}</span></> :
+                      <div title="สถานะพอร์ตจริงจากข้อมูล SNMP ล่าสุด">
+                        <span className="device-port-count mono">{upPorts}<span> / {physicalPorts.length}</span></span>
+                        <div className={'device-port-track' + (device.status !== 'online' ? ' inactive' : '')} aria-hidden="true">
+                          <i style={{ width: (physicalPorts.length ? upPorts / physicalPorts.length * 100 : 0) + '%' }} />
+                        </div>
+                      </div>}
+                  </td>
+                  <td className="device-col-uptime">
+                    <span className="device-uptime mono" title={pending ? 'ยังไม่มีข้อมูล SNMP' : uptime}>
+                      {pending ? '—' : uptime}
+                    </span>
+                  </td>
+                  <td className="r">
+                    <div className="device-row-actions">
+                      <button className="btn device-ports-button" onClick={() => openDevice(device.id)}
+                        aria-label={'ดูพอร์ต ' + device.name}>ดูพอร์ต</button>
+                      <DeviceActionMenu label={'จัดการ ' + device.name} actions={[
+                        { label: pending ? 'ตั้งค่า IP/SNMP' : 'แก้ไขอุปกรณ์', icon: 'i-cog', onSelect: () => setEditingDevice(device) },
+                        { label: 'ลบอุปกรณ์', icon: 'i-trash', danger: true, onSelect: () => deleteDevice(device.id) },
+                      ]} />
+                    </div>
+                  </td>
+                </tr>;
+              })}
             </tbody>
           </table>
+        </div>}
+        {!filteredDevices.length && <div className="devices-empty">
+          <span className="devices-empty-icon"><Icon name={hasFilters ? 'i-search' : 'i-server'} size={24} /></span>
+          <h3>{hasFilters ? 'ไม่พบอุปกรณ์ที่ตรงกับตัวกรอง' : 'ยังไม่มีอุปกรณ์ในระบบ'}</h3>
+          <p>{hasFilters ? 'ลองเปลี่ยนคำค้นหา หรือแสดงอุปกรณ์ทั้งหมด' : 'เพิ่มอุปกรณ์ด้วย IP หรือค้นหาอุปกรณ์ที่เปิด SNMP'}</p>
+          <button className="btn" onClick={hasFilters ? clearFilters : () => setIsAddModalOpen(true)}>{hasFilters ? 'ล้างตัวกรอง' : 'เพิ่มด้วย IP'}</button>
+        </div>}
+        <div className="devices-list-footer">
+          <Icon name="i-circle-check" size={14} aria-hidden="true" />
+          <span>คลิกชื่ออุปกรณ์เพื่อดูพอร์ตและทราฟฟิก · อุปกรณ์ที่พบผ่าน CDP/LLDP ต้องยืนยัน SNMP ก่อน Config</span>
         </div>
       </div>
 
@@ -625,36 +657,42 @@ export const DevicesView: React.FC = () => {
       
       {/* SNMP network scan modal */}
       {showEveNGModal && (
-        <div className="modal-backdrop" onClick={() => setShowEveNGModal(false)}>
+        <div className="modal" onClick={() => setShowEveNGModal(false)}>
           <div
+            ref={scanDialog}
             className="sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="scan-device-title"
             onClick={(e) => e.stopPropagation()}
             style={{ maxWidth: '650px' }}
           >
             <div className="sheet-head">
               <div>
-                <h2>ค้นหาอุปกรณ์ด้วย SNMP</h2>
+                <h2 id="scan-device-title">ค้นหาอุปกรณ์ด้วย SNMP</h2>
                 <p>ค้นหาอุปกรณ์จริงหรือ node ใน EVE-NG ที่เปิด SNMP และมี Management IP</p>
               </div>
-              <button className="icon-btn" onClick={() => setShowEveNGModal(false)}>
+              <button className="icon-btn" onClick={() => setShowEveNGModal(false)} aria-label="ปิด">
                 <Icon name="i-x" />
               </button>
             </div>
 
             <div className="sheet-body">
               <div className="field">
-                <label>Network CIDR</label>
+                <label htmlFor="device-scan-cidr">Network CIDR</label>
                 <input
+                  id="device-scan-cidr"
                   type="text"
                   value={scanNetworkCidr}
                   onChange={(e) => setScanNetworkCidr(e.target.value)}
                   placeholder="192.168.213.0/24"
                 />
-                <small className="hint">ระบุ subnet ของ Management IP ที่ Backend เข้าถึงได้</small>
+                <small className="hint">ระบุ subnet ของ Management IP ที่ระบบเข้าถึงได้</small>
               </div>
               <div className="field">
-                <label>SNMP communities</label>
+                <label htmlFor="device-scan-communities">SNMP communities</label>
                 <input
+                  id="device-scan-communities"
                   type="text"
                   value={scanCommunities}
                   onChange={(e) => setScanCommunities(e.target.value)}
@@ -662,9 +700,9 @@ export const DevicesView: React.FC = () => {
                 />
                 <small className="hint">ใส่ community คั่นด้วย comma; ระบบจะแสดงอุปกรณ์เมื่ออ่าน SNMP และ IF-MIB ได้</small>
               </div>
-              <div className="testbox on" style={{ background: '#e3f2fd', borderColor: '#2196f3' }}>
+              <div className="testbox device-scan-note">
                 <b>ค้นพบผ่าน SNMP เท่านั้น</b>
-                <p style={{ marginTop: '8px', fontSize: '13px' }}>ใช้ได้กับอุปกรณ์จริงและ EVE-NG node เมื่อเปิด SNMP บน node และกำหนด Management IP ที่เข้าถึงได้</p>
+                <p>อุปกรณ์จริงและอุปกรณ์ใน EVE-NG ต้องมี Management IP เปิด SNMP และอนุญาตให้ระบบเข้าถึงได้</p>
               </div>
             </div>
 

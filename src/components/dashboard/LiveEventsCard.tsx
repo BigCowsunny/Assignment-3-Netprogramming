@@ -44,7 +44,7 @@ export const LiveEventsCard: React.FC = () => {
             </div>
           ))
         ) : (
-          <div className="empty">ยังไม่มีเหตุการณ์</div>
+          <div className="empty"><Icon name="i-bell" size={24} /><p><b>ยังไม่มีเหตุการณ์</b></p><p>Link up / down จะปรากฏเมื่อได้รับ Trap</p></div>
         )}
       </div>
     </div>

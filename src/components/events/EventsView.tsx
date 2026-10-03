@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
-import { fmtHM } from '../../utils/formatters';
+import { fmtFull } from '../../utils/formatters';
 
 export const EventsView: React.FC = () => {
   const {
@@ -45,28 +45,30 @@ export const EventsView: React.FC = () => {
   };
 
   return (
-    <section className="view active">
+    <section className="view active events-view">
       <div className="page-head">
         <div>
           <h1>เหตุการณ์ (Trap)</h1>
-          <p>รายการ linkUp · linkDown ที่ได้รับจาก Trap Receiver (UDP 162) แบบเรียลไทม์</p>
+          <p>เหตุการณ์ Link up / down ที่อุปกรณ์ส่งผ่าน SNMP Trap</p>
         </div>
 
         <label className="sw-row" style={{ border: 0, padding: 0, gap: '9px' }}>
           <span className="txt" style={{ fontSize: '13px' }}>
-            รับ Trap แบบเรียลไทม์
-            <span className="hint">WebSocket</span>
+            แสดงผลสด
+            <span className="hint">ระบบรับ Trap ต่อเนื่อง แม้พักการแสดงผลสด</span>
           </span>
           <button
             className={`sw ${isRealtime ? 'on' : ''}`}
             role="switch"
             aria-checked={isRealtime}
-            aria-label="รับ Trap แบบเรียลไทม์"
+            aria-label="แสดงผลสด"
             onClick={() => setIsRealtime(!isRealtime)}
           />
         </label>
       </div>
 
+      <div className="card">
+      <div className="event-summary"><span><b>{events.length}</b>เหตุการณ์</span><span><i className="status-dot up" /> Link up <b>{events.filter(e => e.type === 'linkUp').length}</b></span><span><i className="status-dot down" /> Link down <b>{events.filter(e => e.type === 'linkDown').length}</b></span><span>Unknown source <b>{events.filter(e => e.dev === 'unknown').length}</b></span></div>
       <div className="toolbar">
         <select
           value={filterDev}
@@ -118,8 +120,7 @@ export const EventsView: React.FC = () => {
         </span>
       </div>
 
-      <div className="card">
-        <div className="tablewrap">
+        {!!filteredEvents.length && <div className="tablewrap">
           <table className="data">
             <thead>
               <tr>
@@ -137,7 +138,7 @@ export const EventsView: React.FC = () => {
                   const isUnknown = e.dev === 'unknown';
                   return (
                     <tr key={e.id} className={e.isNew ? 'fresh' : ''}>
-                      <td className="mono">{fmtHM(e.t)}</td>
+                      <td className="mono">{fmtFull(e.t)}</td>
                       <td>
                         {isUnknown ? (
                           <span className="pill warn">
@@ -172,13 +173,14 @@ export const EventsView: React.FC = () => {
               ) : (
                 <tr>
                   <td colSpan={6} className="empty">
-                    ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง
+                    <Icon name="i-bell" size={24} /><p><b>{events.length ? 'ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง' : 'ยังไม่ได้รับ Trap'}</b></p><p>{events.length ? 'ลองเปลี่ยนหรือล้างตัวกรอง' : 'ตั้งค่าอุปกรณ์ให้ส่ง Link up / down Trap มาที่เครื่องนี้'}</p>
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
-        </div>
+        </div>}
+        {!filteredEvents.length && <div className="empty"><Icon name="i-bell" size={24}/><p><b>{events.length ? 'ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง' : 'ยังไม่ได้รับ Trap'}</b></p><p>{events.length ? 'ลองเปลี่ยนหรือล้างตัวกรอง' : 'ตั้งค่าอุปกรณ์ให้ส่ง Link up / down Trap มาที่เครื่องนี้'}</p></div>}
       </div>
     </section>
   );

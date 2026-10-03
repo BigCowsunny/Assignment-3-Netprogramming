@@ -2,7 +2,7 @@ import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { useLatestTraffic } from '../../hooks/useLatestTraffic';
-import { shortN } from '../../utils/formatters';
+import { fmtPercent, shortN } from '../../utils/formatters';
 
 export const DashboardDeviceTable: React.FC = () => {
   const { devices, openDevice, setView } = useSnmp();
@@ -38,7 +38,7 @@ export const DashboardDeviceTable: React.FC = () => {
           <i style={{ width: `${val}%` }}></i>
         </div>
         <div className="sub">
-          {val}% · {shortN(p.name)}
+          {fmtPercent(v)} · {shortN(p.name)}
         </div>
       </>
     );
