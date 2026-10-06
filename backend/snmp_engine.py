@@ -20,6 +20,7 @@ from pysnmp.hlapi.v3arch.asyncio import (
     bulk_cmd,
 )
 from pysnmp.proto.rfc1902 import Integer32, OctetString
+from pysnmp.proto.rfc1905 import NoSuchObject, NoSuchInstance, EndOfMibView
 
 logger = logging.getLogger("snmp_engine")
 
@@ -43,6 +44,17 @@ OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"
 OID_IF_HC_IN_OCTETS = "1.3.6.1.2.1.31.1.1.1.6"
 OID_IF_HC_OUT_OCTETS = "1.3.6.1.2.1.31.1.1.1.10"
 OID_IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"
+OID_IF_HIGH_SPEED = "1.3.6.1.2.1.31.1.1.1.15"
+OID_IF_DISCONTINUITY = "1.3.6.1.2.1.31.1.1.1.19"
+OID_IP_IFINDEX = "1.3.6.1.2.1.4.20.1.2"
+MISSING_VALUES = (NoSuchObject, NoSuchInstance, EndOfMibView)
+
+
+class InterfaceRows(list):
+    """Distinguish a complete IF-MIB snapshot from a partial failed walk."""
+    def __init__(self, values=(), complete=True):
+        super().__init__(values)
+        self.complete = complete
 
 # 32-bit fallback counters
 OID_IF_IN_OCTETS = "1.3.6.1.2.1.2.2.1.10"
@@ -85,6 +97,8 @@ async def snmp_get_system_info(ip: str, community: str = "public", port: int = 1
 
         res = {"ok": True}
         for varBind in varBinds:
+            if isinstance(varBind[1], MISSING_VALUES):
+                continue
             oid = str(varBind[0])
             val = str(varBind[1])
             if oid == OID_SYS_DESCR:
@@ -98,6 +112,8 @@ async def snmp_get_system_info(ip: str, community: str = "public", port: int = 1
                 except Exception:
                     res["uptime"] = val
 
+        if not any(key in res for key in ("descr", "name", "uptime_ticks")):
+            return {"ok": False, "error": "SNMP ตอบกลับแต่ไม่อนุญาตให้อ่าน system MIB", "error_code": "system_unavailable"}
         return res
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -134,9 +150,19 @@ async def snmp_set_admin_status(
 
         if errorStatus:
             status_str = str(errorStatus.prettyPrint())
-            if "noSuchName" in status_str or "notWritable" in status_str:
-                return {"ok": False, "error": "SNMP SET ล้มเหลว: community เป็น read-only หรือ MIB ไม่อนุญาตแก้ไข"}
-            return {"ok": False, "error": f"SNMP Error: {status_str}"}
+            if status_str in ("noAccess", "authorizationError"):
+                return {
+                    "ok": False,
+                    "error_code": status_str,
+                    "error": f"อุปกรณ์ปฏิเสธสิทธิ์เขียน SNMP ({status_str}) ตรวจสอบว่า Community ที่บันทึกในโปรแกรมตรงกับ RW ของอุปกรณ์ และ ACL/SNMP View อนุญาตให้เครื่องนี้แก้ไข ifAdminStatus",
+                }
+            if status_str in ("noSuchName", "notWritable", "noCreation"):
+                return {
+                    "ok": False,
+                    "error_code": status_str,
+                    "error": f"อุปกรณ์ไม่อนุญาตแก้ไขพอร์ตผ่าน SNMP ({status_str}) ตรวจสอบ ifIndex, สิทธิ์ RW และการรองรับ ifAdminStatus ของอุปกรณ์",
+                }
+            return {"ok": False, "error_code": status_str, "error": f"SNMP Error: {status_str}"}
 
         # Read back to verify
         read_error, read_status, read_index, read_vbs = await get_cmd(
@@ -156,7 +182,7 @@ async def snmp_set_admin_status(
         verified_admin = int(read_vbs[0][1])
         admin_res = "up" if verified_admin == 1 else "down"
         expected_admin = "up" if status_code == 1 else "down"
-        if admin_res != expected_admin:
+        if verified_admin != status_code:
             return {"ok": False, "error": f"อุปกรณ์ยังรายงาน ifAdminStatus={admin_res} หลังสั่ง {expected_admin}"}
 
         oper_res = None
@@ -194,6 +220,7 @@ async def snmp_walk_interfaces(
     """
     engine = SnmpEngine()
     interfaces = {}
+    complete = True
 
     try:
         transport = await UdpTransportTarget.create((ip, port), timeout=timeout, retries=1)
@@ -208,6 +235,7 @@ async def snmp_walk_interfaces(
             lexicographicMode=False,
         ):
             if errorIndication or errorStatus:
+                complete = False
                 break
             for vb in varBinds:
                 oid_str = str(vb[0])
@@ -217,7 +245,7 @@ async def snmp_walk_interfaces(
                     interfaces[if_idx] = {
                         "idx": if_idx,
                         "name": descr,
-                        "speed": 1000,
+                        "speed": 0,
                         "admin": "unknown",
                         "oper": "unknown",
                         "errors": 0,
@@ -237,6 +265,7 @@ async def snmp_walk_interfaces(
             lexicographicMode=False,
         ):
             if errorIndication or errorStatus:
+                complete = False
                 break
             for vb in varBinds:
                 oid_str = str(vb[0])
@@ -257,6 +286,7 @@ async def snmp_walk_interfaces(
             lexicographicMode=False,
         ):
             if errorIndication or errorStatus:
+                complete = False
                 break
             for vb in varBinds:
                 oid_str = str(vb[0])
@@ -284,7 +314,7 @@ async def snmp_walk_interfaces(
                 if if_idx in interfaces:
                     try:
                         raw_speed = int(vb[1])
-                        interfaces[if_idx]["speed"] = max(10, raw_speed // 1000000)
+                        interfaces[if_idx]["speed"] = raw_speed / 1000000
                     except Exception:
                         pass
 
@@ -297,6 +327,7 @@ async def snmp_walk_interfaces(
             (OID_IF_PHYS_ADDR, "mac"),
             (OID_IF_IN_ERRORS, "in_errors"),
             (OID_IF_OUT_ERRORS, "out_errors"),
+            (OID_IF_HIGH_SPEED, "high_speed"),
         )
         for base_oid, field in optional_columns:
             try:
@@ -315,13 +346,15 @@ async def snmp_walk_interfaces(
                         if if_idx not in interfaces:
                             continue
                         value = vb[1]
+                        if isinstance(value, MISSING_VALUES):
+                            continue
                         if field == "mac":
                             try:
                                 raw_mac = bytes(value)
                                 interfaces[if_idx][field] = ":".join(f"{octet:02x}" for octet in raw_mac)
                             except Exception:
                                 interfaces[if_idx][field] = str(value)
-                        elif field in ("in_errors", "out_errors"):
+                        elif field in ("in_errors", "out_errors", "high_speed"):
                             try:
                                 interfaces[if_idx][field] = int(value)
                             except Exception:
@@ -333,7 +366,24 @@ async def snmp_walk_interfaces(
             except Exception as column_error:
                 logger.debug(f"Optional interface column {base_oid} unavailable on {ip}: {column_error}")
 
+        # IPv4 addresses can identify a trap sent from a different router interface.
+        async for error, status, _, values in walk_cmd(
+            engine, CommunityData(community), transport, ContextData(),
+            ObjectType(ObjectIdentity(OID_IP_IFINDEX)), lexicographicMode=False,
+        ):
+            if error or status:
+                break
+            for oid, value in values:
+                if isinstance(value, MISSING_VALUES):
+                    continue
+                index = int(value)
+                if index in interfaces and str(oid).startswith(OID_IP_IFINDEX + "."):
+                    interfaces[index]["ip"] = str(oid)[len(OID_IP_IFINDEX) + 1:]
+
         for interface in interfaces.values():
+            high_speed = interface.pop("high_speed", 0)
+            if high_speed > 0:
+                interface["speed"] = high_speed
             if interface.get("name"):
                 interface["alias"] = interface.get("alias") or interface["name"]
             interface["errors"] = interface.pop("in_errors", 0) + interface.pop("out_errors", 0)
@@ -342,115 +392,58 @@ async def snmp_walk_interfaces(
 
     except Exception as e:
         logger.warning(f"Interface walk failed for {ip}: {e}")
+        complete = False
     finally:
         engine.close_dispatcher()
 
-    return sorted(list(interfaces.values()), key=lambda x: x["idx"])
+    complete = complete and all(p["admin"] != "unknown" and p["oper"] != "unknown" for p in interfaces.values())
+    return InterfaceRows(sorted(interfaces.values(), key=lambda x: x["idx"]), complete=complete)
 
 
 async def snmp_poll_octets(
-    ip: str,
-    community: str = "public",
-    port: int = 161,
-    if_indices: Optional[List[int]] = None
+    ip: str, community: str = "public", port: int = 161,
+    if_indices: Optional[List[int]] = None,
 ) -> Dict[int, Dict[str, int]]:
-    """
-    Poll 64-bit HC counters (or 32-bit fallback) for calculating bps (FR-4.3, FR-4.4)
-    Returns: {if_index: {'in_octets': int, 'out_octets': int}}
-    """
-    engine = SnmpEngine()
-    results = {}
-
+    """Read counters with their actual width and discontinuity marker."""
+    if if_indices == []:
+        return {}
+    engine, results = SnmpEngine(), {}
     try:
         transport = await UdpTransportTarget.create((ip, port), timeout=2.0, retries=1)
 
-        # Walk ifHCInOctets
-        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
-            engine,
-            CommunityData(community),
-            transport,
-            ContextData(),
-            ObjectType(ObjectIdentity(OID_IF_HC_IN_OCTETS)),
-            lexicographicMode=False,
-        ):
-            if errorIndication or errorStatus:
-                break
-            for vb in varBinds:
-                if_idx = int(str(vb[0]).split(".")[-1])
-                if if_indices and if_idx not in if_indices:
-                    continue
-                try:
-                    val = int(vb[1])
-                    if if_idx not in results:
-                        results[if_idx] = {}
-                    results[if_idx]["in_octets"] = val
-                except Exception:
-                    pass
-
-        # Walk ifHCOutOctets
-        async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
-            engine,
-            CommunityData(community),
-            transport,
-            ContextData(),
-            ObjectType(ObjectIdentity(OID_IF_HC_OUT_OCTETS)),
-            lexicographicMode=False,
-        ):
-            if errorIndication or errorStatus:
-                break
-            for vb in varBinds:
-                if_idx = int(str(vb[0]).split(".")[-1])
-                if if_indices and if_idx not in if_indices:
-                    continue
-                try:
-                    val = int(vb[1])
-                    if if_idx not in results:
-                        results[if_idx] = {}
-                    results[if_idx]["out_octets"] = val
-                except Exception:
-                    pass
-
-        # Old switches and some EVE images expose only the 32-bit IF-MIB counters.
-        missing_in = [idx for idx in (if_indices or []) if results.get(idx, {}).get("in_octets") is None]
-        if missing_in:
-            async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
+        async def column(oid, field, bits=None):
+            async for error, status, _, values in walk_cmd(
                 engine, CommunityData(community), transport, ContextData(),
-                ObjectType(ObjectIdentity(OID_IF_IN_OCTETS)), lexicographicMode=False,
+                ObjectType(ObjectIdentity(oid)), lexicographicMode=False,
             ):
-                if errorIndication or errorStatus:
+                if error or status:
                     break
-                for vb in varBinds:
-                    if_idx = int(str(vb[0]).split(".")[-1])
-                    if if_indices and if_idx not in if_indices:
+                for name, value in values:
+                    if not str(name).startswith(oid + ".") or isinstance(value, MISSING_VALUES):
                         continue
-                    if if_idx not in results:
-                        results[if_idx] = {}
+                    idx = int(str(name).split(".")[-1])
+                    if if_indices is not None and idx not in if_indices:
+                        continue
                     try:
-                        results[if_idx].setdefault("in_octets", int(vb[1]))
-                    except Exception:
-                        pass
+                        number = int(value)
+                    except (ValueError, TypeError):
+                        continue
+                    sample = results.setdefault(idx, {})
+                    if field not in sample:
+                        sample[field] = number
+                        if bits:
+                            sample[field + "_bits"] = bits
 
-        missing_out = [idx for idx in (if_indices or []) if results.get(idx, {}).get("out_octets") is None]
-        if missing_out:
-            async for (errorIndication, errorStatus, _, varBinds) in walk_cmd(
-                engine, CommunityData(community), transport, ContextData(),
-                ObjectType(ObjectIdentity(OID_IF_OUT_OCTETS)), lexicographicMode=False,
-            ):
-                if errorIndication or errorStatus:
-                    break
-                for vb in varBinds:
-                    if_idx = int(str(vb[0]).split(".")[-1])
-                    if if_indices and if_idx not in if_indices:
-                        continue
-                    if if_idx not in results:
-                        results[if_idx] = {}
-                    try:
-                        results[if_idx].setdefault("out_octets", int(vb[1]))
-                    except Exception:
-                        pass
-    except Exception as e:
-        logger.warning(f"Octet poll failed for {ip}: {e}")
+        for field, high, low in (
+            ("in_octets", OID_IF_HC_IN_OCTETS, OID_IF_IN_OCTETS),
+            ("out_octets", OID_IF_HC_OUT_OCTETS, OID_IF_OUT_OCTETS),
+        ):
+            await column(high, field, 64)
+            if if_indices is None or any(field not in results.get(idx, {}) for idx in if_indices):
+                await column(low, field, 32)
+        await column(OID_IF_DISCONTINUITY, "discontinuity")
+    except Exception as error:
+        logger.warning("Octet poll failed for %s: %s", ip, error)
     finally:
         engine.close_dispatcher()
-
     return results

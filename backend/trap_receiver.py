@@ -16,6 +16,7 @@ from pysnmp.proto import api
 
 from database import add_audit_log, add_event, get_all_devices, save_device, update_interface_status
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
+from device_types import classify_device
 
 logger = logging.getLogger("trap_receiver")
 
@@ -66,13 +67,11 @@ async def _discover_from_trap(source_ip: str, community: str) -> Optional[dict]:
         return None
 
     interfaces = await snmp_walk_interfaces(source_ip, community, timeout=2.5)
-    if not interfaces:
+    if not interfaces or not getattr(interfaces, "complete", True):
         logger.warning("Trap received from %s, but SNMP returned no interfaces", source_ip)
         return None
 
     descr = info.get("descr", "")
-    lowered = descr.lower()
-    switch_markers = ("switch", "catalyst", "nexus", "iol l2", "c2960", "c3560", "c3750", "c3850", "c1000", "cat9k")
     safe_ip = "".join(char if char.isalnum() else "_" for char in source_ip)
     device = {
         "id": f"trap_{safe_ip}"[:80],
@@ -81,7 +80,7 @@ async def _discover_from_trap(source_ip: str, community: str) -> Optional[dict]:
         "ver": "v2c",
         "community": community,
         "snmp_port": 161,
-        "type": "switch" if any(marker in lowered for marker in switch_markers) else "router",
+        "type": classify_device(descr),
         "vendor": descr[:48] or "SNMP device",
         "descr": descr,
         "status": "online",
@@ -92,6 +91,8 @@ async def _discover_from_trap(source_ip: str, community: str) -> Optional[dict]:
     # requests above were in flight. Preserve its stable ID in that case.
     current = next((item for item in get_all_devices() if item.get("ip") == source_ip), None)
     if current:
+        if not current.get("discovery_only"):
+            return current
         device["id"] = current["id"]
     save_device(device)
     add_audit_log("snmp-trap", "Auto Discovery via SNMP Trap", source_ip, "สำเร็จ")
@@ -106,10 +107,11 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
     def __init__(self, on_trap_callback: Optional[Callable] = None):
         self.on_trap_callback = on_trap_callback
         self.transport = None
+        self.tasks = set()
 
     def connection_made(self, transport):
         self.transport = transport
-        logger.info("SNMP Trap listener ready on UDP port 162")
+        logger.info("SNMP Trap listener ready on %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple):
         src_ip = addr[0]
@@ -119,95 +121,85 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
             trap_data = self.parse_trap(data, src_ip)
             if trap_data:
                 # Handle trap in async task
-                asyncio.create_task(self.handle_parsed_trap(trap_data))
+                if len(self.tasks) >= 256:
+                    logger.warning("Trap queue full; dropped notification from %s", src_ip)
+                    return
+                task = asyncio.create_task(self.handle_parsed_trap(trap_data))
+                self.tasks.add(task)
+                task.add_done_callback(self._task_done)
         except Exception as e:
             logger.error(f"Failed to process trap from {src_ip}: {e}")
 
+    def _task_done(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logger.error("Trap processing failed: %s", task.exception())
+
+    def connection_lost(self, exc):
+        for task in list(self.tasks):
+            task.cancel()
+
     def parse_trap(self, data: bytes, src_ip: str) -> Optional[dict]:
-        """Decode SNMPv2c / SNMPv1 trap packet"""
+        """Decode real v1/v2c notifications, including v1 interface varbinds."""
         try:
-            # Try decoding as SNMPv2c
-            msg, _ = decoder.decode(data, asn1Spec=api.v2c.Message())
-            community = str(api.v2c.apiMessage.get_community(msg))
-            pdu = api.v2c.apiMessage.get_pdu(msg)
-            if pdu.tagSet != api.v2c.SNMPv2TrapPDU.tagSet:
+            version = int(api.decodeMessageVersion(data))
+            proto = api.v1 if version == 0 else api.v2c if version == 1 else None
+            if proto is None:
                 return None
-            varbinds = api.v2c.apiPDU.get_varbinds(pdu)
-
-            trap_type = "unknown"
+            message, trailing = decoder.decode(data, asn1Spec=proto.Message())
+            if trailing:
+                return None
+            pdu = proto.apiMessage.get_pdu(message)
             trap_oid = ""
-            if_index = None
-            if_name = None
-            admin_status = None
-            oper_status = None
-            raw_vbs = {}
-
-            for vb in varbinds:
-                oid_str = str(vb[0])
-                val_str = str(vb[1])
-                raw_vbs[oid_str] = val_str
-
-                if oid_str == OID_SNMP_TRAP_OID:
-                    trap_oid = val_str
-                    if OID_LINK_DOWN == val_str:
-                        trap_type = "linkDown"
-                    elif OID_LINK_UP == val_str:
-                        trap_type = "linkUp"
-                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.1."):  # ifIndex
-                    try:
-                        if_index = int(val_str)
-                    except Exception:
-                        pass
-                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.7."):  # ifAdminStatus
-                    try:
-                        admin_status = "up" if int(val_str) == 1 else "down"
-                    except Exception:
-                        pass
-                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.8."):  # ifOperStatus
-                    try:
-                        oper_status = "up" if int(val_str) == 1 else "down"
-                    except Exception:
-                        pass
-                elif oid_str.startswith("1.3.6.1.2.1.2.2.1.2."):  # ifDescr
-                    if_name = val_str
-
-            if trap_type == "unknown":
-                return None
-
-            return {
-                "source_ip": src_ip,
-                "community": community,
-                "type": trap_type,
-                "oid": trap_oid or (OID_LINK_DOWN if trap_type == "linkDown" else OID_LINK_UP),
-                "if_index": if_index,
-                "if_name": if_name,
-                "admin": admin_status,
-                "oper": oper_status,
-                "raw": raw_vbs
-            }
-        except Exception:
-            # Fallback to SNMPv1 trap
-            try:
-                msg, _ = decoder.decode(data, asn1Spec=api.v1.Message())
-                pdu = api.v1.apiMessage.get_pdu(msg)
-                generic_trap = int(api.v1.apiTrapPDU.get_generic_trap(pdu))
-                if generic_trap not in (2, 3):
+            if version == 0:
+                if pdu.tagSet != api.v1.TrapPDU.tagSet:
                     return None
-                trap_type = "linkDown" if generic_trap == 2 else "linkUp"
-                return {
-                    "source_ip": src_ip,
-                    "community": str(api.v1.apiMessage.get_community(msg)),
-                    "type": trap_type,
-                    "oid": OID_LINK_DOWN if trap_type == "linkDown" else OID_LINK_UP,
-                    "if_index": None,
-                    "if_name": None,
-                    "admin": None,
-                    "oper": "down" if trap_type == "linkDown" else "up",
-                    "raw": {}
-                }
-            except Exception as e:
-                logger.error(f"Cannot parse SNMP packet: {e}")
+                generic = int(proto.apiTrapPDU.get_generic_trap(pdu))
+                if generic not in (2, 3):
+                    return None
+                trap_oid = OID_LINK_DOWN if generic == 2 else OID_LINK_UP
+                varbinds = proto.apiTrapPDU.get_varbinds(pdu)
+            else:
+                if pdu.tagSet != api.v2c.SNMPv2TrapPDU.tagSet:
+                    return None
+                varbinds = proto.apiPDU.get_varbinds(pdu)
+            raw = {str(oid): str(value) for oid, value in varbinds}
+            if version == 1:
+                trap_oid = raw.get(OID_SNMP_TRAP_OID, "")
+            if trap_oid not in (OID_LINK_DOWN, OID_LINK_UP):
                 return None
+            result = {
+                "source_ip": src_ip, "community": str(proto.apiMessage.get_community(message)),
+                "type": "linkDown" if trap_oid == OID_LINK_DOWN else "linkUp",
+                "oid": trap_oid, "if_index": None, "if_name": None, "admin": None,
+                "oper": "down" if trap_oid == OID_LINK_DOWN else "up", "raw": raw,
+            }
+            for oid, value in raw.items():
+                if oid.startswith("1.3.6.1.2.1.2.2.1.1."):
+                    try:
+                        result["if_index"] = int(value) if int(value) > 0 else None
+                    except ValueError:
+                        pass
+            for oid, value in raw.items():
+                for base, field in (("1.3.6.1.2.1.2.2.1.7.", "admin"),
+                                    ("1.3.6.1.2.1.2.2.1.8.", "oper"),
+                                    ("1.3.6.1.2.1.2.2.1.2.", "if_name"),
+                                    ("1.3.6.1.2.1.31.1.1.1.1.", "if_name")):
+                    if not oid.startswith(base):
+                        continue
+                    index = int(oid[len(base):])
+                    if result["if_index"] is None and index > 0:
+                        result["if_index"] = index
+                    if result["if_index"] != index:
+                        continue
+                    if field == "if_name":
+                        result[field] = value
+                    elif value in ("1", "2"):
+                        result[field] = "up" if value == "1" else "down"
+            return result
+        except Exception:
+            logger.debug("Ignoring malformed SNMP packet from %s", src_ip)
+            return None
 
     async def handle_parsed_trap(self, trap_data: dict):
         src_ip = trap_data["source_ip"]
@@ -218,15 +210,13 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         devices = get_all_devices()
         matched_dev = None
         for dev in devices:
-            if dev["ip"] == src_ip and not dev.get("discovery_only"):
+            addresses = {dev["ip"], *(port.get("ip", "") for port in dev.get("ports", []))}
+            if src_ip in addresses and not dev.get("discovery_only"):
                 matched_dev = dev
                 break
 
-        if not matched_dev:
-            matched_dev = await _discover_from_trap(src_ip, trap_data.get("community", ""))
-
         device_id = matched_dev["id"] if matched_dev else "unknown"
-        device_name = matched_dev["name"] if matched_dev else "Unknown Source"
+        device_name = matched_dev["name"] if matched_dev else src_ip
 
         # Determine port name
         port_name = trap_data["if_name"]
@@ -245,7 +235,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         # Update interface oper status in DB if device is known
         new_oper = "down" if trap_type == "linkDown" else "up"
         if matched_dev and port_name:
-            update_interface_status(device_id, port_name, oper=new_oper)
+            update_interface_status(device_id, port_name, admin=trap_data.get("admin"), oper=new_oper)
 
         # Store in events table
         add_event(
@@ -271,10 +261,18 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 "type": trap_type,
                 "oid": trap_oid,
                 "oper": new_oper,
+                "admin": trap_data.get("admin"),
                 "isNew": True
             }
         }
         await ws_manager.broadcast(ws_payload)
+        # Record receipt immediately, even if the sender cannot be queried.
+        # Trap community is not necessarily the device's read community.
+        if not matched_dev and src_ip not in ("127.0.0.1", "::1"):
+            try:
+                await asyncio.wait_for(_discover_from_trap(src_ip, trap_data.get("community", "")), timeout=8)
+            except asyncio.TimeoutError:
+                logger.info("Trap recorded; sender %s could not be enrolled yet", src_ip)
 
 
 async def start_trap_listener(port: int = 162) -> asyncio.DatagramTransport:
@@ -286,14 +284,6 @@ async def start_trap_listener(port: int = 162) -> asyncio.DatagramTransport:
             local_addr=("0.0.0.0", port)
         )
         logger.info(f"SNMP Trap Receiver started on UDP 0.0.0.0:{port}")
-        return transport
-    except PermissionError:
-        logger.warning(f"Permission denied for port {port}. Trying fallback port 1162...")
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: SnmpTrapProtocol(),
-            local_addr=("0.0.0.0", 1162)
-        )
-        logger.info("SNMP Trap Receiver started on UDP 0.0.0.0:1162 (redirect from 162 recommended)")
         return transport
     except Exception as e:
         if port != 1162:

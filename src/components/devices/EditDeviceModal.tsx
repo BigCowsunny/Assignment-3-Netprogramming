@@ -48,7 +48,8 @@ export const EditDeviceModal: React.FC<EditDeviceModalProps> = ({
       setSnmpPort(String(device.snmp_port || device.port || 161));
       setTestResult(null);
     }
-  }, [device, isOpen]);
+  // Live polling replaces device objects; preserve the user's unsaved credentials.
+  }, [device?.id, isOpen]);
 
   if (!isOpen || !device) return null;
 

@@ -7,6 +7,7 @@ from pysnmp.proto.rfc1905 import NoSuchObject, NoSuchInstance, EndOfMibView
 from database import get_all_devices, get_device, save_device, add_audit_log, get_topology_links, replace_topology_observations, record_discovered_neighbor, normalize_port_name, normalize_mac, management_ip
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
 from network_scanner import scan_network, _device_type
+from device_types import classify_device
 
 OID_LLDP_REM_SYS_NAME = "1.0.8802.1.1.2.1.4.1.1.9"
 OID_LLDP_REM_PORT_ID = "1.0.8802.1.1.2.1.4.1.1.7"
@@ -64,7 +65,7 @@ def resolve_port(device, identifier, subtype=5, description=""):
     identifier, description = _text(identifier), _text(description)
     for port in device.get("ports", []):
         names = {normalize_port_name(port["name"]).lower()}
-        if port.get("alias"): names.add(str(port["alias"]).lower())
+        if port.get("alias"): names.add(normalize_port_name(str(port["alias"])).lower())
         if normalize_port_name(identifier).lower() in names or normalize_port_name(description).lower() in names:
             return port["name"]
         if subtype == 3 and normalize_mac(identifier) and normalize_mac(port.get("mac", "")) == normalize_mac(identifier):
@@ -98,7 +99,9 @@ async def read_neighbors(device):
     ports_by_index = {int(port["idx"]): port["name"] for port in device.get("ports", [])}
     for suffix, name in columns["cdp_names"].items():
         remote_port = columns["cdp_ports"].get(suffix)
-        if not _text(name) or not remote_port: continue
+        if not _text(name): continue
+        if not remote_port:
+            cdp["complete"] = False
         local = ports_by_index.get(_number(suffix.split(".")[0]), "")
         address = columns["cdp_ips"].get(suffix, b"")
         remote_ip = management_ip(str(ipaddress.IPv4Address(address))) if isinstance(address, bytes) and len(address) == 4 else management_ip(address)
@@ -106,7 +109,7 @@ async def read_neighbors(device):
         flags = int.from_bytes(cap, "big") if isinstance(cap, bytes) else _number(cap)
         cdp["neighbors"].append({"identity": _text(name), "name": _text(name), "port": _text(remote_port),
             "management_ip": remote_ip, "protocol": "CDP", "ttl": 180,
-            "platform": _text(columns["cdp_models"].get(suffix, "")), "device_type": "switch" if flags & 8 else "router",
+            "platform": _text(columns["cdp_models"].get(suffix, "")), "device_type": classify_device(_text(columns["cdp_models"].get(suffix, "")), flags),
             "observer_id": device["id"], "local_port": local})
     management = {}
     for suffix in columns["lldp_ips"]:
@@ -133,7 +136,9 @@ async def read_neighbors(device):
         local_type = _number(columns["local_types"].get(local_num), 5)
         local_id = raw_local.hex(":") if local_type == 3 and isinstance(raw_local, bytes) else _text(raw_local)
         local = resolve_port(device, local_id, local_type, columns["local_desc"].get(local_num, ""))
-        if not name or not port_name: continue
+        if not name: continue
+        if not port_name:
+            lldp["complete"] = False
         lldp["neighbors"].append({"identity": name, "name": name, "port": port_name,
             "port_id": port_id, "port_subtype": subtype, "port_description": desc,
             "chassis_id": chassis_id, "chassis_mac": chassis_mac, "management_ip": management.get(suffix, ""),
@@ -151,8 +156,8 @@ def persist_neighbors(device, groups):
             remote, _ = record_discovered_neighbor(neighbor)
             found.append(remote)
             local = neighbor["local_port"]
-            if not local:
-                issues.append({"ip": device["ip"], "name": device["name"], "code": "port_unresolved", "message": f"{protocol}: พบ {remote['name']} แต่จับคู่ local port กับ IF-MIB ไม่ได้"})
+            if not local or not neighbor.get("port"):
+                issues.append({"ip": device["ip"], "name": device["name"], "code": "port_unresolved", "message": f"{protocol}: พบ {remote['name']} แต่ข้อมูลพอร์ตทั้งสองฝั่งยังไม่ครบ"})
                 group["complete"] = False
                 continue
             if remote["id"] == device["id"]: continue
@@ -252,15 +257,28 @@ async def discover_network(seed_ip="", community="", subnet="", *, communities=N
             continue
         await report("reading_interfaces", ip)
         ports = await snmp_walk_interfaces(ip, selected, port)
-        if not ports:
+        if not ports or not getattr(ports, "complete", True):
             issues.append({"ip": ip, "code": "interfaces_unavailable", "message": "SNMP ตอบแต่ IF-MIB อ่านพอร์ตไม่ได้"})
             continue
         description = probe.get("descr", "")
         saved = {**(device or {}), "id": (device or {}).get("id") or "discovery_" + ip.replace(".", "_"), "ip": ip, "name": probe.get("name") or (device or {}).get("name") or ip, "ver": "v2c", "community": selected, "snmp_port": port, "type": _device_type(description), "descr": description, "vendor": description[:48], "status": "online", "up": probe.get("uptime", ""), "ports": ports}
+        current = get_device(saved["id"]) or get_device(ip)
+        if device and not device.get("discovery_only"):
+            if not current or any(current.get(key) != device.get(key) for key in ("ip", "community", "snmp_port")):
+                issues.append({"ip": ip, "code": "settings_changed", "message": "การตั้งค่าเปลี่ยนระหว่างค้นหา; จะอ่านใหม่ในรอบถัดไป"})
+                continue
+            # Successful reads with another RO community must not replace saved RW credentials.
+            saved["community"] = current["community"]
+        if current:
+            saved["id"] = current["id"]
         save_device(saved)
         device = get_device(saved["id"])
         await report("reading_neighbors", ip, device["name"])
-        neighbors, warnings = persist_neighbors(device, await read_neighbors(device))
+        groups = await read_neighbors({**device, "community": selected})
+        current = get_device(device["id"])
+        if not current or any(current.get(key) != device.get(key) for key in ("ip", "community", "snmp_port")):
+            continue
+        neighbors, warnings = persist_neighbors(current, groups)
         issues.extend(warnings)
         for neighbor in neighbors:
             if neighbor.get("ip"):

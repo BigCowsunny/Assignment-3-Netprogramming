@@ -7,6 +7,7 @@ import os
 import struct
 import threading
 from typing import Optional
+from device_types import classify_device
 
 logger = logging.getLogger("cdp_receiver")
 CDP_DESTINATION = bytes.fromhex("01000ccccccc")
@@ -91,7 +92,7 @@ def parse_cdp_frame(frame: bytes, interface: str = "") -> Optional[dict]:
             "management_ip": addresses[0] if addresses else "",
             "port": port, "platform": _text(fields.get(6, b"")),
             "description": _text(fields.get(5, b"")),
-            "device_type": "switch" if capabilities & 8 else "router",
+            "device_type": classify_device(_text(fields.get(6, b"")), capabilities),
             "protocol": "CDP", "ttl": ttl, "capture_interface": interface,
         }
     except (ValueError, IndexError, struct.error):

@@ -602,6 +602,22 @@ def delete_device(dev_id: str):
     conn.close()
 
 
+def update_device_metrics(device: dict, info: dict) -> bool:
+    """Update telemetry only if the connection settings still match the read."""
+    conn = get_db()
+    try:
+        cursor = conn.execute("""
+            UPDATE devices SET status=?, up_time=?, sys_descr=?, last_seen=CURRENT_TIMESTAMP
+            WHERE id=? AND ip=? AND community=? AND snmp_port=?
+        """, ("online" if info.get("ok") else "offline",
+              info.get("uptime", device.get("up", "")), info.get("descr", device.get("descr", "")),
+              device["id"], device["ip"], device.get("community", ""), device.get("snmp_port", 161)))
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
 def save_topology_link(device_a: str, port_a: str, device_b: str, port_b: str, protocol: str):
     """Persist a neighbor relationship discovered from LLDP or CDP."""
     conn = get_db()
@@ -630,7 +646,7 @@ def replace_topology_observations(observer_id: str, protocol: str, links: list, 
         for link in links:
             key = json.dumps(sorted(((link["a"], normalize_port_name(link["pa"]).lower()),
                                      (link["b"], normalize_port_name(link["pb"]).lower()))))
-            conn.execute("INSERT INTO topology_observations VALUES (?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT OR REPLACE INTO topology_observations VALUES (?,?,?,?,?,?,?,?,?)",
                          (observer_id, protocol, key, link["a"], link["pa"], link["b"], link["pb"], now, now + ttl))
         conn.commit()
     finally:
@@ -785,10 +801,13 @@ def get_aggregate_traffic(range_type: str = "day") -> List[Dict[str, Any]]:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT (timestamp / ?) * ? AS timestamp, SUM(in_bps) AS in_bps, SUM(out_bps) AS out_bps
-    FROM traffic_samples
-    WHERE timestamp >= ?
-    GROUP BY (timestamp / ?) * ?
+    SELECT timestamp, SUM(in_bps) AS in_bps, SUM(out_bps) AS out_bps
+    FROM (
+        SELECT (timestamp / ?) * ? AS timestamp, AVG(in_bps) AS in_bps, AVG(out_bps) AS out_bps
+        FROM traffic_samples WHERE timestamp >= ?
+        GROUP BY device_id, port_name, (timestamp / ?) * ?
+    )
+    GROUP BY timestamp
     ORDER BY timestamp ASC
     """, (bucket_ms, bucket_ms, threshold, bucket_ms, bucket_ms))
     rows = cursor.fetchall()

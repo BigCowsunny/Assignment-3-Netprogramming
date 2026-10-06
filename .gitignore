@@ -1,4 +1,8 @@
 node_modules/
+.venv/
+venv/
+backend/.venv/
+backend/venv/
 dist/
 *.local
 .env

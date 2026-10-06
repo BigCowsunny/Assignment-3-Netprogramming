@@ -247,31 +247,37 @@ export function connectTrapWebSocket(
   onMessage: (data: any) => void,
   onOpen?: () => void,
   onClose?: () => void
-): WebSocket | null {
-  try {
-    const ws = new WebSocket(WS_BASE_URL);
-    ws.onopen = () => {
-      if (onOpen) onOpen();
-    };
-    ws.onmessage = (event) => {
-      try {
-        const parsed = JSON.parse(event.data);
-        onMessage(parsed);
-      } catch (err) {
-        console.error('Error parsing WS message:', err);
-      }
-    };
-    ws.onclose = () => {
-      if (onClose) onClose();
-    };
-    ws.onerror = (err) => {
-      console.warn('WebSocket error:', err);
-    };
-    return ws;
-  } catch (err) {
-    console.warn('Could not establish WebSocket connection:', err);
-    return null;
-  }
+): { close: () => void } {
+  let socket: WebSocket | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  let retry = 0;
+  const schedule = () => {
+    if (!stopped) timer = setTimeout(connect, Math.min(1000 * 2 ** retry++, 15000));
+  };
+  const connect = () => {
+    if (stopped) return;
+    try {
+      const ws = new WebSocket(WS_BASE_URL);
+      socket = ws;
+      ws.onopen = () => { retry = 0; onOpen?.(); };
+      ws.onmessage = (event) => {
+        try { onMessage(JSON.parse(event.data)); }
+        catch (error) { console.error('Invalid live event:', error); }
+      };
+      ws.onclose = () => { onClose?.(); schedule(); };
+      ws.onerror = () => ws.close();
+    } catch { schedule(); }
+  };
+  connect();
+  return { close: () => {
+    stopped = true;
+    clearTimeout(timer);
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+  } };
 }
 
 export interface CdpCaptureStatus {

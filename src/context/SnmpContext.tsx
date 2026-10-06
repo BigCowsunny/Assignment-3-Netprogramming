@@ -580,6 +580,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // Receive only actual backend trap/status events over the WebSocket.
   useEffect(() => {
     if (!isRealtime || !isBackendConnected) return;
+    let active = true;
     const socket = connectTrapWebSocket((message) => {
       if (message.type === 'TRAP_EVENT' && message.event) {
         const event = { ...message.event, t: new Date(message.event.t) } as TrapEvent;
@@ -587,7 +588,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         if (event.dev !== 'unknown') {
           setDevices((prev) => prev.map((device) => device.id !== event.dev ? device : {
             ...device,
-            ports: device.ports.map((port) => port.name === event.port ? { ...port, oper: event.type === 'linkDown' ? 'down' : 'up' } : port),
+            ports: device.ports.map((port) => port.name === event.port ? { ...port, oper: event.type === 'linkDown' ? 'down' : 'up', ...(message.event.admin ? { admin: message.event.admin } : {}) } : port),
           }));
         }
         addToast(event.type === 'linkDown' ? 'bad' : 'ok', event.type === 'linkDown' ? 'Link Down (SNMP Trap)' : 'Link Up (SNMP Trap)', `${event.src} · ${event.port}`);
@@ -615,8 +616,19 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           addToast('ok', 'พบอุปกรณ์จาก SNMP Trap', `${discovered.name} · ${discovered.ip} · ${discovered.ports.length} interfaces`);
         }
       }
+    }, () => {
+      // Recover stored notifications received while the browser was disconnected.
+      void fetchEventsApi().then((rows) => {
+        if (!active) return;
+        setEvents(previous => {
+          const merged = new Map<string, TrapEvent>();
+          rows.forEach((row: TrapEvent) => merged.set(row.id, { ...row, t: new Date(row.t) }));
+          previous.forEach(row => merged.set(row.id, row));
+          return [...merged.values()].sort((a, b) => b.t.getTime() - a.t.getTime()).slice(0, 80);
+        });
+      }).catch(() => {});
     });
-    return () => socket?.close();
+    return () => { active = false; socket.close(); };
   }, [isRealtime, isBackendConnected]);
 
   const connectBackend = async (): Promise<boolean> => {

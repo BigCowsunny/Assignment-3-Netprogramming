@@ -31,14 +31,51 @@ export const TopologyConnections: React.FC<Props> = ({ devices, positions, links
     const my = (posA.y + posB.y) / 2 + dx / distance * offset;
     const cx = (posA.x + posB.x) / 2 - dy / distance * offset * 2;
     const cy = (posA.y + posB.y) / 2 + dx / distance * offset * 2;
+    // A saved layout can place unrelated nodes directly between two endpoints.
+    // Route around their icon and label so a real R1-R2 link cannot look like
+    // a link between the nodes it happens to pass through.
+    const blockers = devices.filter((device) => device.id !== link.a && device.id !== link.b)
+      .map((device) => positions[device.id]).filter((pos): pos is TopologyNodePos => !!pos);
+    const crossesNode = (x1: number, y1: number, x2: number, y2: number, node: TopologyNodePos) => {
+      if (Math.abs(x2 - x1) < 1) {
+        return Math.abs(x1 - node.x) < 72 &&
+          Math.max(Math.min(y1, y2), node.y - 55) < Math.min(Math.max(y1, y2), node.y + 70);
+      }
+      if (Math.abs(y2 - y1) < 1) {
+        return Math.abs(y1 - node.y) < 70 &&
+          Math.max(Math.min(x1, x2), node.x - 72) < Math.min(Math.max(x1, x2), node.x + 72);
+      }
+      const t = Math.max(0, Math.min(1, ((node.x - x1) * (x2 - x1) + (node.y - y1) * (y2 - y1)) /
+        ((x2 - x1) ** 2 + (y2 - y1) ** 2)));
+      return t > 0.05 && t < 0.95 &&
+        Math.abs(x1 + t * (x2 - x1) - node.x) < 72 &&
+        Math.abs(y1 + t * (y2 - y1) - node.y) < 70;
+    };
+    let path = 'M ' + posA.x + ' ' + posA.y + ' Q ' + cx + ' ' + cy + ' ' + posB.x + ' ' + posB.y;
+    let labelX = mx, labelY = my;
+    if (!link.shared && blockers.some((node) => crossesNode(posA.x, posA.y, posB.x, posB.y, node))) {
+      const candidates = [
+        Math.max(25, Math.min(posA.y, posB.y) - 85),
+        Math.min(440, Math.max(posA.y, posB.y) + 95), 25, 440,
+      ];
+      const clear = candidates.find((routeY) => blockers.every((node) =>
+        !crossesNode(posA.x, posA.y, posA.x, routeY, node) &&
+        !crossesNode(posA.x, routeY, posB.x, routeY, node) &&
+        !crossesNode(posB.x, routeY, posB.x, posB.y, node)));
+      if (clear !== undefined) {
+        path = `M ${posA.x} ${posA.y} L ${posA.x} ${clear} L ${posB.x} ${clear} L ${posB.x} ${posB.y}`;
+        labelX = (posA.x + posB.x) / 2;
+        labelY = clear;
+      }
+    }
     const label = link.shared ? shortN(link.pa) : shortN(link.pa) + ' ↔ ' + shortN(link.pb);
     const width = Math.max(62, label.length * 6.3 + 16);
     const title = A.name + ' [' + link.pa + '] ↔ ' +
       (link.shared ? 'เครือข่ายร่วม' : B!.name + ' [' + link.pb + ']');
     return {
-      link, label, width, title, mx, my,
+      link, label, width, title, mx: labelX, my: labelY,
       state: unknown ? 'unknown' : up ? 'up' : 'down',
-      path: 'M ' + posA.x + ' ' + posA.y + ' Q ' + cx + ' ' + cy + ' ' + posB.x + ' ' + posB.y,
+      path,
     };
   });
   return <>

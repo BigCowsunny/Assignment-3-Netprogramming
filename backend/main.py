@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +75,7 @@ async def lifespan(app: FastAPI):
         _trap_transport.close()
     if _poller_task:
         _poller_task.cancel()
+        await asyncio.gather(_poller_task, return_exceptions=True)
 
 
 app = FastAPI(
@@ -98,18 +99,18 @@ app.add_middleware(
 class DeviceCreateRequest(BaseModel):
     name: Optional[str] = ""
     ip: str
-    snmp_version: str = "v2c"
-    community: str = "public"
-    port: int = 161
+    snmp_version: Literal["v2c"] = "v2c"
+    community: str = Field(default="public", min_length=1)
+    port: int = Field(default=161, ge=1, le=65535)
     device_type: str = "switch"
 
 
 class DeviceUpdateRequest(BaseModel):
     name: str
     ip: str
-    snmp_version: str = "v2c"
-    community: str = "public"
-    port: int = 161
+    snmp_version: Literal["v2c"] = "v2c"
+    community: str = Field(default="public", min_length=1)
+    port: int = Field(default=161, ge=1, le=65535)
     device_type: str = "switch"
     vendor: Optional[str] = ""
     status: Optional[str] = "online"
@@ -192,7 +193,7 @@ async def test_device_connection(req: DeviceCreateRequest):
         return {
             "status": "err",
             "message": "การเชื่อมต่อล้มเหลว",
-            "details": f"SNMP Timeout (2s) — ไม่มีอุปกรณ์ตอบกลับที่ {req.ip}:{req.port} · ตรวจสอบ IP และ Firewall UDP 161"
+            "details": f"{req.ip}:{req.port} · {res.get('error', 'SNMP ไม่ตอบกลับ')} · ตรวจสอบ Community, SNMP View และ Firewall UDP {req.port}"
         }
 
     dev_name = req.name or res.get("name") or (f"SW-{req.ip.split('.')[-1]}" if req.device_type == "switch" else f"RTR-{req.ip.split('.')[-1]}")
@@ -218,7 +219,7 @@ async def create_device(req: DeviceCreateRequest):
 
     # Walk interfaces from device
     ports = await snmp_walk_interfaces(req.ip, req.community, req.port)
-    if not ports:
+    if not ports or not getattr(ports, "complete", True):
         raise HTTPException(status_code=422, detail=f"SNMP ตอบกลับที่ {req.ip}:{req.port} แต่ดึง interface ไม่ได้ ตรวจสอบสิทธิ์ community และ IF-MIB")
 
     dev_id = existing["id"] if existing else f"d_{int(time.time()*1000)}"
@@ -275,7 +276,7 @@ async def update_single_device(device_id: str, req: DeviceUpdateRequest):
     if not probe.get("ok"):
         raise HTTPException(status_code=422, detail=f"เชื่อมต่อ SNMP ไม่สำเร็จที่ {req.ip}:{req.port}: {probe.get('error', 'timeout')}")
     ports = await snmp_walk_interfaces(req.ip, req.community, req.port)
-    if not ports:
+    if not ports or not getattr(ports, "complete", True):
         raise HTTPException(status_code=422, detail=f"SNMP ตอบกลับที่ {req.ip}:{req.port} แต่ดึง interface ไม่ได้")
 
     dev["name"] = req.name
@@ -350,7 +351,8 @@ async def set_port_admin_status(device_id: str, port_name: str, req: InterfaceAd
     )
 
     if not res.get("ok"):
-        add_audit_log("admin", f"สั่ง {('Shutdown' if req.status == 'down' else 'No Shutdown')} {port_name}", dev["name"], "ล้มเหลว")
+        reason = res.get("error_code")
+        add_audit_log("admin", f"สั่ง {('Shutdown' if req.status == 'down' else 'No Shutdown')} {port_name}", dev["name"], f"ล้มเหลว ({reason})" if reason else "ล้มเหลว")
         return {"ok": False, "error": res.get("error", "SNMP SET failed"), "snmp_detail": res}
 
     # Persist only the state read back from the actual device.
@@ -422,10 +424,11 @@ async def trigger_test_trap():
     )
     from pysnmp.proto.rfc1902 import Integer32, OctetString
 
+    engine = SnmpEngine()
     try:
         transport = await UdpTransportTarget.create(("127.0.0.1", _trap_port), timeout=2.0, retries=0)
         error_indication, error_status, _, _ = await send_notification(
-            SnmpEngine(), CommunityData("public"), transport, ContextData(), "trap",
+            engine, CommunityData("public"), transport, ContextData(), "trap",
             NotificationType(ObjectIdentity("1.3.6.1.6.3.1.1.5.4")).add_varbinds(
                 ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.1.1"), Integer32(1)),
                 ObjectType(ObjectIdentity("1.3.6.1.2.1.2.2.1.7.1"), Integer32(1)),
@@ -441,6 +444,8 @@ async def trigger_test_trap():
     except Exception as e:
         logger.exception("Failed to send test SNMP Trap")
         return {"ok": False, "error": str(e)}
+    finally:
+        engine.close_dispatcher()
 
 
 @app.get("/api/audit-logs")

@@ -7,13 +7,12 @@ Meets PRD FR-4.3, FR-4.4, FR-4.5 requirements (bps rate, counter wrap, reboot ha
 import asyncio
 import logging
 import time
-from typing import Dict, Tuple
 
 from database import (
     get_all_devices,
-    save_device,
+    update_device_metrics,
+    get_device,
     save_traffic_sample,
-    update_interface_status,
 )
 from snmp_engine import snmp_get_system_info, snmp_poll_octets
 from trap_receiver import ws_manager
@@ -21,8 +20,9 @@ from trap_receiver import ws_manager
 logger = logging.getLogger("poller")
 
 # Memory cache for previous counter samples:
-# {(device_id, if_index): (timestamp, in_octets, out_octets)}
-_prev_counters: Dict[Tuple[str, int], Tuple[float, int, int]] = {}
+# {(device_id, if_index): (monotonic_time, counters/width/discontinuity, connection_identity)}
+_prev_counters: dict = {}
+_prev_uptime: dict = {}
 _poll_interval_seconds = 60
 _interval_changed = asyncio.Event()
 
@@ -47,7 +47,6 @@ async def poll_device_metrics(device: dict):
     dev_id = device["id"]
     ip = device["ip"]
     community = device.get("community", "public")
-    ver = device.get("ver", "v2c")
     snmp_port = int(device.get("snmp_port", 161) or 161)
 
     # 1. Check device liveness via sysUpTime (FR-1.5)
@@ -56,37 +55,36 @@ async def poll_device_metrics(device: dict):
     new_status = "online" if is_online else "offline"
 
     status_changed = device.get("status") != new_status
-    if status_changed or is_online:
-        device["status"] = new_status
-        if is_online:
-            device["up"] = sys_info.get("uptime", device.get("up", ""))
-            if sys_info.get("name"):
-                device["name"] = sys_info["name"]
-            if sys_info.get("descr"):
-                device["descr"] = sys_info["descr"]
-        # A liveness response must not overwrite interface state received via Trap.
-        metadata = {key: value for key, value in device.items() if key != "ports"}
-        save_device(metadata)
-
-        if status_changed:
-            await ws_manager.broadcast({
-                "type": "DEVICE_STATUS_CHANGE",
-                "device_id": dev_id,
-                "status": new_status,
-                "uptime": device.get("up", "")
-            })
-
-    if not is_online:
+    if not update_device_metrics(device, sys_info):
+        # Device was deleted or its credentials/address changed during the request.
         return
+    if status_changed:
+        await ws_manager.broadcast({
+            "type": "DEVICE_STATUS_CHANGE", "device_id": dev_id,
+            "status": new_status, "uptime": sys_info.get("uptime", device.get("up", "")),
+        })
+    uptime = sys_info.get("uptime_ticks")
+    previous_uptime = _prev_uptime.get(dev_id)
+    if not is_online or (uptime is not None and previous_uptime is not None and uptime < previous_uptime):
+        for key in list(_prev_counters):
+            if key[0] == dev_id:
+                del _prev_counters[key]
+    if not is_online:
+        _prev_uptime.pop(dev_id, None)
+        return
+    _prev_uptime[dev_id] = uptime
 
     # 2. Poll interface traffic octets (FR-4.3)
     ports = device.get("ports", [])
     if not ports:
         return
 
-    active_indices = [p["idx"] for p in ports if not p.get("virtual")]
+    active_indices = [p["idx"] for p in ports]
     octets_data = await snmp_poll_octets(ip, community, port=snmp_port, if_indices=active_indices)
-    now = time.time()
+    current = get_device(dev_id)
+    if not current or any(current.get(key) != device.get(key) for key in ("ip", "community", "snmp_port")):
+        return
+    now = time.monotonic()
 
     for port in ports:
         idx = port["idx"]
@@ -103,44 +101,38 @@ async def poll_device_metrics(device: dict):
 
         cache_key = (dev_id, idx)
         prev = _prev_counters.get(cache_key)
-        _prev_counters[cache_key] = (now, cur_in, cur_out)
-
+        identity = (ip, community, snmp_port, pname)
+        _prev_counters[cache_key] = (now, sample.copy(), identity)
         if not prev:
             continue
-
-        prev_time, prev_in, prev_out = prev
+        prev_time, previous, previous_identity = prev
         dt = now - prev_time
-        if dt <= 0.1:
+        if dt <= 0.1 or identity != previous_identity:
+            continue
+        if sample.get("discontinuity") != previous.get("discontinuity"):
             continue
 
-        # FR-4.4: Calculate bps and handle counter wrap / reboot
-        # If counter drops significantly, check for counter wrap or reboot
-        diff_in = cur_in - prev_in
-        diff_out = cur_out - prev_out
-
-        # Counter wrapped or device rebooted
-        if diff_in < 0:
-            if cur_in < 4294967296 and prev_in < 4294967296:
-                diff_in = (4294967296 - prev_in) + cur_in  # 32-bit wrap
-            else:
-                # Reboot or invalid jump: skip point to prevent bogus spike
-                diff_in = 0
-
-        if diff_out < 0:
-            if cur_out < 4294967296 and prev_out < 4294967296:
-                diff_out = (4294967296 - prev_out) + cur_out  # 32-bit wrap
-            else:
-                diff_out = 0
-
-        in_bps = (diff_in * 8) / dt
-        out_bps = (diff_out * 8) / dt
-
-        # Sanity check: max speed cap
-        max_bps = port["speed"] * 1e6 * 1.5
-        if in_bps > max_bps:
-            in_bps = max_bps
-        if out_bps > max_bps:
-            out_bps = max_bps
+        rates = []
+        speed = float(port.get("speed", 0) or 0) * 1e6
+        for field in ("in_octets", "out_octets"):
+            bits = sample.get(field + "_bits", 64)
+            if bits != previous.get(field + "_bits", 64):
+                break
+            difference = sample[field] - previous[field]
+            if bits == 32 and speed and speed * dt / 8 >= 2**32:
+                # Multiple wraps are indistinguishable. Do not invent a rate.
+                break
+            if difference < 0:
+                if bits != 32 or not speed or sample.get("discontinuity") is None:
+                    break
+                difference += 2**32
+            rate = difference * 8 / dt
+            if speed and rate > speed * 1.05:
+                break
+            rates.append(rate)
+        if len(rates) != 2:
+            continue
+        in_bps, out_bps = rates
 
         # Save to database
         save_traffic_sample(dev_id, pname, cur_in, cur_out, in_bps, out_bps)
@@ -155,7 +147,17 @@ async def run_poller_loop(poll_interval_seconds: int = 60):
             devices = get_all_devices()
             tasks = [poll_device_metrics(dev) for dev in devices]
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for device, result in zip(devices, results):
+                    if isinstance(result, Exception):
+                        logger.error("Polling failed for %s: %s", device["id"], result)
+            ids = {device["id"] for device in devices}
+            for key in list(_prev_counters):
+                if key[0] not in ids:
+                    del _prev_counters[key]
+            for key in list(_prev_uptime):
+                if key not in ids:
+                    del _prev_uptime[key]
         except Exception as e:
             logger.error(f"Error in poller loop: {e}")
 

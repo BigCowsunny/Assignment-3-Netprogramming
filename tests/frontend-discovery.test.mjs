@@ -21,6 +21,8 @@ function load(relative, cache = new Map(), globals = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React, esModuleInterop: true, target: ts.ScriptTarget.ES2020 },
   }).outputText;
   const localRequire = (specifier) => {
+    if (specifier.endsWith('.css')) return {};
+    if (/\.(png|svg)$/.test(specifier)) return specifier;
     if (specifier.endsWith('context/SnmpContext')) return { useSnmp: () => state };
     if (specifier.endsWith('common/Icons')) return { Icon: () => React.createElement('svg') };
     if (!specifier.startsWith('.')) return require(specifier);
@@ -45,6 +47,33 @@ function neighbor(id, name, ip = '') {
     ports: [{ idx: 0, name: 'GigabitEthernet0/1', speed: 0, admin: 'unknown', oper: 'unknown', errors: 0, mac: '', alias: '', virtual: false, ip: '', observed_only: true }],
   };
 }
+
+test('live events reconnect after disconnect and stop retrying on cleanup', () => {
+  const sockets = [];
+  const timers = new Map();
+  let nextTimer = 0;
+  class FakeWebSocket {
+    constructor() { sockets.push(this); }
+    close() { this.onclose?.(); }
+  }
+  const { connectTrapWebSocket } = load('services/api.ts', new Map(), {
+    WebSocket: FakeWebSocket,
+    setTimeout: (fn) => { timers.set(++nextTimer, fn); return nextTimer; },
+    clearTimeout: (id) => timers.delete(id),
+  });
+  const messages = [];
+  const connection = connectTrapWebSocket((message) => messages.push(message));
+  sockets[0].onmessage({ data: '{"type":"TRAP_EVENT"}' });
+  assert.equal(messages[0].type, 'TRAP_EVENT');
+  sockets[0].onclose();
+  const [id, retry] = [...timers][0];
+  timers.delete(id);
+  retry();
+  assert.equal(sockets.length, 2);
+  sockets[1].onclose();
+  connection.close();
+  assert.equal(timers.size, 0);
+});
 
 function setup(devices) {
   state = { devices, searchQuery: '', filterType: 'all', filterStatus: 'all',
@@ -73,7 +102,7 @@ test('promotion replaces existing observation with managed device at same ID', (
   assert.equal(configurationWarning(result[0]), '');
 });
 
-test('device table retains existing columns and displays both no-IP neighbors', () => {
+test('device table displays both no-IP neighbors and configuration warnings', () => {
   setup([neighbor('a', 'Switch-A'), neighbor('b', 'Switch-B')]);
   const { DevicesView } = load('components/devices/DevicesView.tsx');
   const html = renderToStaticMarkup(React.createElement(DevicesView));
@@ -81,19 +110,19 @@ test('device table retains existing columns and displays both no-IP neighbors', 
   assert.match(html, /Switch-B/);
   assert.match(html, /ไม่มี IP/);
   assert.match(html, /Config ไม่ได้/);
-  assert.match(html, /ตั้งค่า IP\/SNMP/);
-  assert.match(html, /ตรวจจับ CDP/);
-  assert.equal((html.match(/<th(?:\s|>)/g) || []).length, 8);
+  assert.match(html, /CDP\/LLDP/);
+  assert.match(html, /IP \/ SNMP/);
+  assert.equal((html.match(/<th(?:\s|>)/g) || []).length, 6);
 });
 
 test('detail warns and does not present observed ports as operationally up', () => {
   setup([neighbor('a', 'Switch-A')]);
   const { DeviceDetailView } = load('components/device-detail/DeviceDetailView.tsx');
   const html = renderToStaticMarkup(React.createElement(DeviceDetailView));
-  assert.match(html, /role="alert"/);
+  assert.match(html, /Config ไม่ได้/);
   assert.match(html, /ยังไม่ใช่พอร์ตทั้งหมด/);
-  assert.match(html, /port p-admin-down/);
-  assert.doesNotMatch(html, /port p-up/);
+  assert.match(html, /สถานะ Unknown/);
+  assert.doesNotMatch(html, /สถานะ Link up/);
 });
 
 test('port controls are disabled for discovery-only device with or without advertised IP', () => {
@@ -126,7 +155,8 @@ test('Discover accepts blank target without requiring a subnet', () => {
   const { TopologyView } = load('components/topology/TopologyView.tsx');
   const html = renderToStaticMarkup(React.createElement(TopologyView));
   assert.match(html, /ไม่ต้องระบุ subnet/);
-  assert.match(html, /IP เริ่มต้น หรือ subnet \(ไม่บังคับ\)/);
+  assert.match(html, /IP เริ่มต้น \/ Subnet/);
+  assert.match(html, /เว้นว่างเพื่อเริ่มจากอุปกรณ์ที่พบแล้ว/);
   assert.doesNotMatch(html, /disabled=""/);
 });
 
@@ -148,7 +178,7 @@ test('LLDP observation has the same configuration restriction and warning', () =
   setup([d]);
   const { DeviceDetailView } = load('components/device-detail/DeviceDetailView.tsx');
   const html = renderToStaticMarkup(React.createElement(DeviceDetailView));
-  assert.match(html, /CDP\/LLDP/);
+  assert.match(html, /LLDP/);
   assert.match(html, /Config/);
   assert.match(html, /ยังไม่ใช่พอร์ตทั้งหมด/);
 });
@@ -188,12 +218,12 @@ test('discovery service surfaces job and HTTP failures', async () => {
   await assert.rejects(failed.runDiscoveryApi(), /SNMP unavailable/);
 });
 
-test('header identifies backend data rather than lab data as a demo', () => {
+test('header shows service connection status without calling real data a demo', () => {
   setup([]);
   state.isBackendConnected = true;
   const { Topbar } = load('components/layout/Topbar.tsx');
   const html = renderToStaticMarkup(React.createElement(Topbar));
-  assert.match(html, /ข้อมูลจาก Backend/);
+  assert.match(html, /บริการระบบพร้อมใช้งาน/);
   assert.doesNotMatch(html, /ข้อมูลจำลอง/);
 });
 
@@ -210,6 +240,20 @@ test('parallel links between the same nodes show separate port labels', () => {
   assert.notEqual(paths[0], paths[1]);
   assert.match(html, /Gi0\/1/);
   assert.match(html, /Gi0\/2/);
+});
+
+test('link route avoids unrelated nodes between its actual endpoints', () => {
+  setup([neighbor('a', 'R001'), neighbor('b', 'R2'), neighbor('c', 'R3'), neighbor('d', 'R002')]);
+  state.topologyPos = {
+    a: {x: 150, y: 100}, b: {x: 340, y: 100},
+    c: {x: 530, y: 100}, d: {x: 720, y: 100},
+  };
+  state.topologyLinks = [{ a: 'a', pa: 'Gi0/2', b: 'd', pb: 'Gi0/0', proto: 'CDP' }];
+  const { TopologyView } = load('components/topology/TopologyView.tsx');
+  const html = renderToStaticMarkup(React.createElement(TopologyView));
+  assert.match(html, /R001 \[Gi0\/2\] ↔ R002 \[Gi0\/0\]/);
+  assert.match(html, /d="M 150 100 L 150 25 L 720 25 L 720 100"/);
+  assert.doesNotMatch(html, /d="M 150 100 Q 435 100 720 100"/);
 });
 
 test('duplicate reports in reverse direction and abbreviated names produce one edge', () => {

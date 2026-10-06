@@ -6,17 +6,13 @@ import logging
 from typing import Dict, List, Optional
 
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
+from device_types import classify_device
 
 logger = logging.getLogger("network_scanner")
 
 
 def _device_type(description: str) -> str:
-    lowered = description.lower()
-    switch_markers = (
-        "switch", "catalyst", "nexus", "iol l2", "c2960", "c3560",
-        "c3750", "c3850", "c1000", "cat9k", "cat3k", "cat4k",
-    )
-    return "switch" if any(marker in lowered for marker in switch_markers) else "router"
+    return classify_device(description)
 
 
 async def scan_host(host: str, communities: List[str], port: int = 161) -> Optional[Dict]:
@@ -27,7 +23,7 @@ async def scan_host(host: str, communities: List[str], port: int = 161) -> Optio
             continue
 
         interfaces = await snmp_walk_interfaces(host, community, port=port, timeout=2.0)
-        if not interfaces:
+        if not interfaces or not getattr(interfaces, "complete", True):
             logger.debug("SNMP answered at %s but returned no interfaces", host)
             continue
 
