@@ -22,7 +22,21 @@ export function resolveTrapEvent(event: TrapEvent, devices: Device[]): TrapEvent
 
 export function trapDeviceName(event: TrapEvent, devices: Device[]): string {
   return devices.find(device => device.id === event.dev)?.name || event.dev_name || event.agent_name ||
+    (event.is_test ? 'NetSmonitor (Test Trap)' : '') ||
     (event.dev === 'unknown' ? 'Unknown Source' : event.dev);
+}
+
+export function trapEventDevice(event: TrapEvent, devices: Device[]): Device | undefined {
+  const resolved = resolveTrapEvent(event, devices);
+  return devices.find(device => device.id === resolved.dev);
+}
+
+export function trapEventDeviceName(event: TrapEvent, devices: Device[]): string {
+  return trapDeviceName(resolveTrapEvent(event, devices), devices);
+}
+
+export function isUnknownTrapSource(event: TrapEvent, devices: Device[]): boolean {
+  return !event.is_test && !trapEventDevice(event, devices);
 }
 
 export function mergeTrapEvents(previous: TrapEvent[], incoming: TrapEvent[]): TrapEvent[] {

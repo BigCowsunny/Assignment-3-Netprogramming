@@ -597,7 +597,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             ports: device.ports.map((port) => port.name === event.port ? { ...port, oper: event.type === 'linkDown' ? 'down' : 'up', ...(message.event.admin ? { admin: message.event.admin } : {}) } : port),
           }));
         }
-        addToast(event.type === 'linkDown' ? 'bad' : 'ok', event.type === 'linkDown' ? 'Link Down (SNMP Trap)' : 'Link Up (SNMP Trap)', `${event.src} · ${event.port}`);
+        addToast(event.type === 'linkDown' ? 'bad' : 'ok', event.type === 'linkDown' ? 'Link Down (SNMP Trap)' : 'Link Up (SNMP Trap)', `${event.dev_name || event.src} · ${event.port}`);
+      } else if (message.type === 'TRAP_EVENT_RESOLVED' && message.event) {
+        setEvents(previous => previous.map(event => event.id === message.event.id
+          ? { ...event, dev: message.event.dev, dev_name: message.event.dev_name } : event));
       } else if (message.type === 'EVENTS_UPDATED') {
         refreshEvents();
       } else if (message.type === 'PORT_STATUS_CHANGE') {

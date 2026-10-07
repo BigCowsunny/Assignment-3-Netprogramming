@@ -14,7 +14,7 @@ from fastapi import WebSocket
 from pyasn1.codec.ber import decoder
 from pysnmp.proto import api
 
-from database import add_audit_log, add_event, get_all_devices, save_device, update_interface_status
+from database import add_audit_log, add_event, get_all_devices, save_device, set_event_device, update_interface_status
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
 from device_types import classify_device
 from trap_identity import OID_TRAP_ADDRESS, match_trap_device, trap_identity
@@ -218,7 +218,8 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         matched_dev = match_trap_device(get_all_devices(), src_ip, agent_ip, agent_name)
 
         device_id = matched_dev["id"] if matched_dev else "unknown"
-        device_name = matched_dev["name"] if matched_dev else agent_name or "Unknown Source"
+        is_test = src_ip in ("127.0.0.1", "::1") and trap_data.get("if_name") == "TestInterface"
+        device_name = matched_dev["name"] if matched_dev else "NetSmonitor (Test Trap)" if is_test else agent_name or "Unknown Source"
 
         # Determine port name
         port_name = trap_data["if_name"]
@@ -268,6 +269,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 "oid": trap_oid,
                 "oper": new_oper,
                 "admin": trap_data.get("admin"),
+                "is_test": is_test,
                 "isNew": True
             }
         }
@@ -280,6 +282,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 discovered = await asyncio.wait_for(_discover_from_trap(
                     target_ip, (matched_dev or {}).get("community") or trap_data.get("community", "")), timeout=8)
                 if discovered:
+                    set_event_device(evt_id, discovered["id"])
                     # Refresh the same stored event after enrollment; do not invent
                     # another link event or replay its interface status.
                     await ws_manager.broadcast({"type": "EVENTS_UPDATED"})

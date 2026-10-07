@@ -43,6 +43,14 @@ test('history refresh replaces stale Unknown with resolved name and does not dup
   assert.equal(result[0].t.getTime(), original.t.getTime());
 });
 
+test('merged Test Trap labels are excluded from unknown device counts', () => {
+  const { trapEventDeviceName, isUnknownTrapSource } = load('utils/trapEvents.ts');
+  const event = { id: 'test', dev: 'unknown', src: '127.0.0.1', port: 'TestInterface', is_test: true };
+  assert.equal(trapEventDeviceName(event, []), 'NetSmonitor (Test Trap)');
+  assert.equal(isUnknownTrapSource(event, []), false);
+  assert.equal(isUnknownTrapSource({ ...event, is_test: false }, []), true);
+});
+
 test('Events and Dashboard show packet sysName before device enrollment', () => {
   setup([]);
   state.events = [{ id: 'e1', dev: 'unknown', src: '198.51.100.9', agent_name: 'Branch-Router',

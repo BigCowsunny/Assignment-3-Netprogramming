@@ -362,6 +362,11 @@ def get_all_devices() -> List[Dict[str, Any]]:
     return devices
 
 
+def find_trap_source_device(source_ip: str, devices: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Resolve a unique transport sender, including CIDR interface addresses."""
+    return match_trap_device(devices if devices is not None else get_all_devices(), source_ip)
+
+
 def management_ip(value: str) -> str:
     """Only usable IPv4 addresses may be passed to this app's SNMP transport."""
     try:
@@ -718,6 +723,16 @@ def add_event(evt_id: str, device_id: str, source_ip: str, port_name: str, trap_
     conn.close()
 
 
+def set_event_device(evt_id: str, device_id: str):
+    """Associate an existing receipt after its sender is confirmed by SNMP."""
+    conn = get_db()
+    try:
+        conn.execute("UPDATE events SET device_id = ? WHERE id = ?", (device_id, evt_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_events(limit: int = 100) -> List[Dict[str, Any]]:
     conn = get_db()
     cursor = conn.cursor()
@@ -742,11 +757,12 @@ def get_events(limit: int = 100) -> List[Dict[str, Any]]:
         if matched and not matched.get("discovery_only") and index:
             port_name = next((port["name"] for port in matched.get("ports", [])
                               if port["idx"] == index), port_name)
+        is_test = r["source_ip"] in ("127.0.0.1", "::1") and r["port_name"] == "TestInterface"
         events.append({
             "id": r["id"],
             "t": r["timestamp"],
             "dev": matched["id"] if matched else r["device_id"],
-            "dev_name": matched["name"] if matched else agent_name or None,
+            "dev_name": matched["name"] if matched else "NetSmonitor (Test Trap)" if is_test else agent_name or None,
             "src": r["source_ip"],
             "agent_ip": agent_ip,
             "agent_name": agent_name,
@@ -754,6 +770,7 @@ def get_events(limit: int = 100) -> List[Dict[str, Any]]:
             "port": port_name,
             "type": r["type"],
             "oid": r["oid"],
+            "is_test": is_test,
         })
     return events
 

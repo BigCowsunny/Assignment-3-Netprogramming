@@ -32,7 +32,7 @@ class TrapIdentityTests(unittest.IsolatedAsyncioTestCase):
         parsed = trap_receiver.SnmpTrapProtocol().parse_trap(payload, "198.51.100.9")
         self.assertIsNotNone(parsed)
         with patch.object(trap_receiver.ws_manager, "broadcast", new_callable=AsyncMock) as broadcast, \
-             patch.object(trap_receiver, "_discover_from_trap", new_callable=AsyncMock) as enroll:
+             patch.object(trap_receiver, "_discover_from_trap", new=AsyncMock(return_value=None)) as enroll:
             await trap_receiver.SnmpTrapProtocol().handle_parsed_trap(parsed)
         return parsed, broadcast, enroll
 
@@ -54,6 +54,17 @@ class TrapIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(broadcast.call_args.args[0]["event"]["dev"], "r2")
         enroll.assert_not_awaited()
         self.assertEqual(database.get_events()[0]["dev_name"], "R2.localdomain")
+
+    async def test_local_test_trap_label_survives_receipt_and_history(self):
+        parsed = trap_receiver.SnmpTrapProtocol().parse_trap(packet(), "::1")
+        parsed["if_name"] = "TestInterface"
+        with patch.object(trap_receiver.ws_manager, "broadcast", new_callable=AsyncMock) as broadcast:
+            await trap_receiver.SnmpTrapProtocol().handle_parsed_trap(parsed)
+        live = broadcast.call_args.args[0]["event"]
+        stored = database.get_events()[0]
+        for event in (live, stored):
+            self.assertTrue(event["is_test"])
+            self.assertEqual(event["dev_name"], "NetSmonitor (Test Trap)")
 
     async def test_first_trap_relates_after_auto_enrollment_without_duplicate_or_status_replay(self):
         parsed = trap_receiver.SnmpTrapProtocol().parse_trap(packet(agent_ip="192.0.2.3"), "198.51.100.9")

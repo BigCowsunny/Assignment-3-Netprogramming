@@ -58,6 +58,7 @@ export interface TrapEvent {
   port: string;
   type: TrapType;
   oid: string;
+  is_test?: boolean;
   isNew?: boolean;
 }
 
