@@ -50,10 +50,12 @@ export interface TrapEvent {
   id: string;
   t: Date;
   dev: string; // device id or 'unknown'
+  dev_name?: string;
   src: string;
   port: string;
   type: TrapType;
   oid: string;
+  is_test?: boolean;
   isNew?: boolean;
 }
 

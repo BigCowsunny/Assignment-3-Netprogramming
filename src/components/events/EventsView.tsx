@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { fmtFull } from '../../utils/formatters';
+import { isUnknownTrapSource, trapEventDevice, trapEventDeviceName } from '../../utils/trapEvents';
 
 export const EventsView: React.FC = () => {
   const {
@@ -17,17 +18,14 @@ export const EventsView: React.FC = () => {
   const [filterType, setFilterType] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const getDeviceName = (devId: string) => {
-    if (devId === 'unknown') return 'Unknown Source';
-    const found = devices.find((d) => d.id === devId);
-    return found ? found.name : devId;
-  };
-
   const filteredEvents = events.filter((e) => {
     const q = searchQuery.trim().toLowerCase();
-    const devName = getDeviceName(e.dev).toLowerCase();
+    const devName = trapEventDeviceName(e, devices).toLowerCase();
+    const matchedDevice = trapEventDevice(e, devices);
 
-    const matchesDev = filterDev === 'all' || e.dev === filterDev;
+    const matchesDev = filterDev === 'all' ||
+      (filterDev === 'unknown' && isUnknownTrapSource(e, devices)) ||
+      (filterDev === 'test' && !!e.is_test) || matchedDevice?.id === filterDev;
     const matchesType = filterType === 'all' || e.type === filterType;
     const matchesQuery =
       !q ||
@@ -68,7 +66,7 @@ export const EventsView: React.FC = () => {
       </div>
 
       <div className="card">
-      <div className="event-summary"><span><b>{events.length}</b>เหตุการณ์</span><span><i className="status-dot up" /> Link up <b>{events.filter(e => e.type === 'linkUp').length}</b></span><span><i className="status-dot down" /> Link down <b>{events.filter(e => e.type === 'linkDown').length}</b></span><span>Unknown source <b>{events.filter(e => e.dev === 'unknown').length}</b></span></div>
+      <div className="event-summary"><span><b>{events.length}</b>เหตุการณ์</span><span><i className="status-dot up" /> Link up <b>{events.filter(e => e.type === 'linkUp').length}</b></span><span><i className="status-dot down" /> Link down <b>{events.filter(e => e.type === 'linkDown').length}</b></span><span>Unknown source <b>{events.filter(e => isUnknownTrapSource(e, devices)).length}</b></span></div>
       <div className="toolbar">
         <select
           value={filterDev}
@@ -77,6 +75,7 @@ export const EventsView: React.FC = () => {
         >
           <option value="all">อุปกรณ์: ทั้งหมด</option>
           <option value="unknown">Unknown Source</option>
+          <option value="test">Test Trap</option>
           {devices.map((d) => (
             <option key={d.id} value={d.id}>
               {d.name}
@@ -135,22 +134,22 @@ export const EventsView: React.FC = () => {
             <tbody>
               {filteredEvents.length ? (
                 filteredEvents.map((e) => {
-                  const isUnknown = e.dev === 'unknown';
+                  const matchedDevice = trapEventDevice(e, devices);
                   return (
                     <tr key={e.id} className={e.isNew ? 'fresh' : ''}>
                       <td className="mono">{fmtFull(e.t)}</td>
                       <td>
-                        {isUnknown ? (
-                          <span className="pill warn">
-                            <i></i>Unknown Source
-                          </span>
-                        ) : (
+                        {matchedDevice ? (
                           <button
                             className="devlink"
-                            onClick={() => openDevice(e.dev)}
+                            onClick={() => openDevice(matchedDevice.id)}
                           >
-                            {getDeviceName(e.dev)}
+                            {matchedDevice.name}
                           </button>
+                        ) : (
+                          <span className={`pill ${e.is_test ? 'off' : 'warn'}`}>
+                            <i></i>{trapEventDeviceName(e, devices)}
+                          </span>
                         )}
                       </td>
                       <td className="mono">{e.port}</td>

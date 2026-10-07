@@ -357,6 +357,23 @@ def get_all_devices() -> List[Dict[str, Any]]:
     return devices
 
 
+def find_trap_source_device(source_ip: str, devices: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Resolve a Trap sender by a unique management or interface IP."""
+    if not source_ip:
+        return None
+    candidates = devices if devices is not None else get_all_devices()
+    for matches in (
+        [device for device in candidates if device.get("ip") == source_ip],
+        [device for device in candidates if any(port.get("ip") == source_ip for port in device.get("ports", []))],
+    ):
+        unique = {device["id"]: device for device in matches}
+        if len(unique) == 1:
+            return next(iter(unique.values()))
+        if unique:
+            return None
+    return None
+
+
 def management_ip(value: str) -> str:
     """Only usable IPv4 addresses may be passed to this app's SNMP transport."""
     try:
@@ -711,24 +728,42 @@ def add_event(evt_id: str, device_id: str, source_ip: str, port_name: str, trap_
     conn.close()
 
 
+def set_event_device(evt_id: str, device_id: str):
+    """Associate an already recorded Trap after its sender is discovered."""
+    conn = get_db()
+    try:
+        conn.execute("UPDATE events SET device_id = ? WHERE id = ?", (device_id, evt_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_events(limit: int = 100) -> List[Dict[str, Any]]:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()
     conn.close()
-    return [
-        {
-            "id": r["id"],
-            "t": r["timestamp"],
-            "dev": r["device_id"],
-            "src": r["source_ip"],
-            "port": r["port_name"],
-            "type": r["type"],
-            "oid": r["oid"],
-        }
-        for r in rows
-    ]
+    devices = get_all_devices()
+    by_id = {device["id"]: device for device in devices}
+    result = []
+    for row in rows:
+        device = by_id.get(row["device_id"])
+        if device is None and row["device_id"] == "unknown":
+            device = find_trap_source_device(row["source_ip"], devices)
+        is_test = row["source_ip"] in ("127.0.0.1", "::1") and row["port_name"] == "TestInterface"
+        result.append({
+            "id": row["id"],
+            "t": row["timestamp"],
+            "dev": device["id"] if device else row["device_id"],
+            "dev_name": device["name"] if device else "NetSmonitor (Test Trap)" if is_test else row["source_ip"],
+            "src": row["source_ip"],
+            "port": row["port_name"],
+            "type": row["type"],
+            "oid": row["oid"],
+            "is_test": is_test,
+        })
+    return result
 
 
 def add_audit_log(user: str, action: str, target: str, result: str):

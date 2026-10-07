@@ -14,7 +14,8 @@ from fastapi import WebSocket
 from pyasn1.codec.ber import decoder
 from pysnmp.proto import api
 
-from database import add_audit_log, add_event, get_all_devices, save_device, update_interface_status
+from database import (add_audit_log, add_event, find_trap_source_device,
+                      get_all_devices, save_device, set_event_device, update_interface_status)
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
 from device_types import classify_device
 
@@ -206,17 +207,12 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         trap_type = trap_data["type"]
         trap_oid = trap_data["oid"]
 
-        # Match device by IP in database
-        devices = get_all_devices()
-        matched_dev = None
-        for dev in devices:
-            addresses = {dev["ip"], *(port.get("ip", "") for port in dev.get("ports", []))}
-            if src_ip in addresses and not dev.get("discovery_only"):
-                matched_dev = dev
-                break
+        # A CDP/LLDP-only node still has a useful name when it reports an IP.
+        matched_dev = find_trap_source_device(src_ip, get_all_devices())
 
         device_id = matched_dev["id"] if matched_dev else "unknown"
-        device_name = matched_dev["name"] if matched_dev else src_ip
+        is_test = src_ip in ("127.0.0.1", "::1") and trap_data.get("if_name") == "TestInterface"
+        device_name = matched_dev["name"] if matched_dev else "NetSmonitor (Test Trap)" if is_test else src_ip
 
         # Determine port name
         port_name = trap_data["if_name"]
@@ -234,7 +230,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
 
         # Update interface oper status in DB if device is known
         new_oper = "down" if trap_type == "linkDown" else "up"
-        if matched_dev and port_name:
+        if matched_dev and not matched_dev.get("discovery_only") and port_name:
             update_interface_status(device_id, port_name, admin=trap_data.get("admin"), oper=new_oper)
 
         # Store in events table
@@ -262,15 +258,24 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 "oid": trap_oid,
                 "oper": new_oper,
                 "admin": trap_data.get("admin"),
+                "is_test": is_test,
                 "isNew": True
             }
         }
         await ws_manager.broadcast(ws_payload)
         # Record receipt immediately, even if the sender cannot be queried.
         # Trap community is not necessarily the device's read community.
-        if not matched_dev and src_ip not in ("127.0.0.1", "::1"):
+        if (not matched_dev or matched_dev.get("discovery_only")) and src_ip not in ("127.0.0.1", "::1"):
             try:
-                await asyncio.wait_for(_discover_from_trap(src_ip, trap_data.get("community", "")), timeout=8)
+                enrolled = await asyncio.wait_for(
+                    _discover_from_trap(src_ip, trap_data.get("community", "")), timeout=8)
+                if enrolled:
+                    set_event_device(evt_id, enrolled["id"])
+                    await ws_manager.broadcast({
+                        "type": "TRAP_EVENT_RESOLVED",
+                        "event": {**ws_payload["event"], "dev": enrolled["id"],
+                                  "dev_name": enrolled["name"]},
+                    })
             except asyncio.TimeoutError:
                 logger.info("Trap recorded; sender %s could not be enrolled yet", src_ip)
 

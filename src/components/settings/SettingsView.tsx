@@ -4,6 +4,7 @@ import { fmtFull } from '../../utils/formatters';
 import { BackendHealth, fetchBackendHealth, savePollingSettingsApi } from '../../services/api';
 import { Icon } from '../common/Icons';
 import { useDeviceDialog } from '../devices/useDeviceDialog';
+import { trapEventDeviceName, isUnknownTrapSource } from '../../utils/trapEvents';
 
 export const SettingsView: React.FC = () => {
   const { events, devices, auditLogs, pollIntervalSeconds, setPollIntervalSeconds, addAuditLog } = useSnmp();
@@ -66,7 +67,7 @@ export const SettingsView: React.FC = () => {
     return () => {active = false; window.clearInterval(timer);};
   }, [setPollIntervalSeconds]);
   const latest = events[0];
-  const deviceName = latest ? devices.find(d => d.id === latest.dev)?.name || 'Unknown Source' : '';
+  const deviceName = latest ? trapEventDeviceName(latest, devices) : '';
   const receiverAvailable = !!health && (health.trap_port || 0) > 0;
   const status = loading ? 'กำลังตรวจสอบ' : health ? 'Connected' : 'Disconnected';
   const filteredAudit = auditLogs.filter(a => [a.user,a.action,a.target,a.result].join(' ').toLowerCase().includes(auditSearch.trim().toLowerCase()));
@@ -85,7 +86,7 @@ export const SettingsView: React.FC = () => {
       </div></div>
       <div className="card"><div className="card-head"><h3>Trap Receiver</h3><span className={'pill ' + (receiverAvailable ? 'ok' : 'off')}>{receiverAvailable ? 'UDP ' + health!.trap_port : loading ? 'กำลังตรวจสอบ' : 'ไม่มีข้อมูล'}</span></div><div className="card-body">
         <div className="service-value"><span>เหตุการณ์ล่าสุด</span><b>{latest ? fmtFull(latest.t) : 'ยังไม่ได้รับ Trap'}</b></div>
-        <div className="service-value"><span>Unknown source</span><b>{events.filter(e => e.dev === 'unknown').length} เหตุการณ์</b></div>
+        <div className="service-value"><span>Unknown source</span><b>{events.filter(e => isUnknownTrapSource(e, devices)).length} เหตุการณ์</b></div>
         {latest && <><p className="service-note">{deviceName} · {latest.port} · {latest.type}</p><pre className="code">{'Source: ' + latest.src + '\nPort: ' + latest.port + '\nTrap OID: ' + latest.oid}</pre></>}
         <p className="service-note">แสดงเหตุการณ์ที่ได้รับจากอุปกรณ์และสถานะพอร์ต UDP ของบริการรับ Trap</p>
       </div></div>
