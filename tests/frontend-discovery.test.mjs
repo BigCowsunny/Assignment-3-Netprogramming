@@ -12,6 +12,54 @@ const require = createRequire(import.meta.url);
 const root = path.resolve('src');
 let state;
 
+test('trap identities separate shared NAT devices and resolve when inventory arrives', () => {
+  const { resolveTrapEvent, trapDeviceName } = load('utils/trapEvents.ts');
+  const devices = [neighbor('r1', 'R1', '192.0.2.1'), neighbor('r2', 'R2.localdomain', '192.0.2.2')];
+  const event = { id: 'e1', dev: 'unknown', src: '198.51.100.9', agent_ip: '192.0.2.2',
+    port: 'Ethernet0/1', type: 'linkDown', t: new Date(), oid: 'linkDown' };
+  assert.equal(resolveTrapEvent(event, []).dev, 'unknown');
+  const resolved = resolveTrapEvent(event, devices);
+  assert.equal(resolved.dev, 'r2');
+  assert.equal(resolved.id, event.id);
+  assert.equal(resolved.src, event.src);
+  assert.equal(trapDeviceName(resolved, devices), 'R2.localdomain');
+  assert.equal(resolveTrapEvent({ ...event, agent_ip: '', agent_name: 'r1' }, devices).dev, 'r1');
+  assert.equal(resolveTrapEvent({ ...event, agent_ip: '', agent_name: '' }, devices).dev, 'unknown');
+  assert.equal(resolveTrapEvent({ ...event, agent_ip: '192.0.2.99' }, [neighbor('gateway', 'GW', event.src)]).dev, 'unknown');
+  assert.equal(resolveTrapEvent({ ...event, agent_ip: '', agent_name: 'r2' },
+    [...devices, neighbor('duplicate', 'R2.example')]).dev, 'unknown');
+});
+
+test('history refresh replaces stale Unknown with resolved name and does not duplicate notifications', () => {
+  const { mergeTrapEvents } = load('utils/trapEvents.ts');
+  const original = { id: 'e1', dev: 'unknown', src: '198.51.100.9', port: 'ifIndex 2',
+    type: 'linkDown', t: new Date('2026-01-01'), oid: 'linkDown', isNew: true };
+  const updated = { ...original, dev: 'r2', dev_name: 'R2', port: 'Et0/1', isNew: undefined };
+  const result = mergeTrapEvents([original], [updated]);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].dev, 'r2');
+  assert.equal(result[0].port, 'Et0/1');
+  assert.equal(result[0].isNew, true);
+  assert.equal(result[0].t.getTime(), original.t.getTime());
+});
+
+test('Events and Dashboard show packet sysName before device enrollment', () => {
+  setup([]);
+  state.events = [{ id: 'e1', dev: 'unknown', src: '198.51.100.9', agent_name: 'Branch-Router',
+    agent_ip: '192.0.2.2', port: 'Et0/1', type: 'linkDown', t: new Date(), oid: 'linkDown' }];
+  state.isRealtime = true;
+  state.setIsRealtime = () => {};
+  state.triggerTestTrap = () => {};
+  const { EventsView } = load('components/events/EventsView.tsx');
+  const { LiveEventsCard } = load('components/dashboard/LiveEventsCard.tsx');
+  const events = renderToStaticMarkup(React.createElement(EventsView));
+  const dashboard = renderToStaticMarkup(React.createElement(LiveEventsCard));
+  assert.match(events, /Branch-Router/);
+  assert.match(events, /Agent IP/);
+  assert.match(events, /192\.0\.2\.2/);
+  assert.match(dashboard, /Branch-Router/);
+});
+
 function load(relative, cache = new Map(), globals = {}) {
   const filename = path.isAbsolute(relative) ? relative : path.join(root, relative);
   if (cache.has(filename)) return cache.get(filename).exports;

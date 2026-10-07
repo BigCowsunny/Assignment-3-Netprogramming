@@ -51,6 +51,10 @@ export interface TrapEvent {
   t: Date;
   dev: string; // device id or 'unknown'
   src: string;
+  dev_name?: string | null;
+  agent_ip?: string;
+  agent_name?: string;
+  if_index?: number | null;
   port: string;
   type: TrapType;
   oid: string;

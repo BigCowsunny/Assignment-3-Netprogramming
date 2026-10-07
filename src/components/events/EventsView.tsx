@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { fmtFull } from '../../utils/formatters';
+import { trapDeviceName } from '../../utils/trapEvents';
 
 export const EventsView: React.FC = () => {
   const {
@@ -17,15 +18,9 @@ export const EventsView: React.FC = () => {
   const [filterType, setFilterType] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const getDeviceName = (devId: string) => {
-    if (devId === 'unknown') return 'Unknown Source';
-    const found = devices.find((d) => d.id === devId);
-    return found ? found.name : devId;
-  };
-
   const filteredEvents = events.filter((e) => {
     const q = searchQuery.trim().toLowerCase();
-    const devName = getDeviceName(e.dev).toLowerCase();
+    const devName = trapDeviceName(e, devices).toLowerCase();
 
     const matchesDev = filterDev === 'all' || e.dev === filterDev;
     const matchesType = filterType === 'all' || e.type === filterType;
@@ -33,6 +28,7 @@ export const EventsView: React.FC = () => {
       !q ||
       e.port.toLowerCase().includes(q) ||
       e.src.includes(q) ||
+      !!e.agent_ip?.includes(q) ||
       devName.includes(q);
 
     return matchesDev && matchesType && matchesQuery;
@@ -69,6 +65,9 @@ export const EventsView: React.FC = () => {
 
       <div className="card">
       <div className="event-summary"><span><b>{events.length}</b>เหตุการณ์</span><span><i className="status-dot up" /> Link up <b>{events.filter(e => e.type === 'linkUp').length}</b></span><span><i className="status-dot down" /> Link down <b>{events.filter(e => e.type === 'linkDown').length}</b></span><span>Unknown source <b>{events.filter(e => e.dev === 'unknown').length}</b></span></div>
+      {events.some(e => e.dev === 'unknown') && <p className="hint" style={{ padding: '0 20px' }}>
+        ชื่อจะอัปเดตเมื่อจับคู่กับอุปกรณ์ได้ หากหลายอุปกรณ์ส่งผ่าน Source IP เดียวกัน ต้องมี Agent IP หรือชื่ออุปกรณ์แนบมากับ Trap
+      </p>}
       <div className="toolbar">
         <select
           value={filterDev}
@@ -99,7 +98,7 @@ export const EventsView: React.FC = () => {
           <input
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="ค้นหา Port / Source IP"
+            placeholder="ค้นหาอุปกรณ์ / Port / IP"
             aria-label="ค้นหา"
           />
         </label>
@@ -129,6 +128,7 @@ export const EventsView: React.FC = () => {
                 <th>Port</th>
                 <th>ชนิด</th>
                 <th>Source IP</th>
+                <th>Agent IP</th>
                 <th>OID (TRAP-TYPE)</th>
               </tr>
             </thead>
@@ -142,14 +142,14 @@ export const EventsView: React.FC = () => {
                       <td>
                         {isUnknown ? (
                           <span className="pill warn">
-                            <i></i>Unknown Source
+                            <i></i>{trapDeviceName(e, devices)}
                           </span>
                         ) : (
                           <button
                             className="devlink"
                             onClick={() => openDevice(e.dev)}
                           >
-                            {getDeviceName(e.dev)}
+                            {trapDeviceName(e, devices)}
                           </button>
                         )}
                       </td>
@@ -166,13 +166,14 @@ export const EventsView: React.FC = () => {
                         )}
                       </td>
                       <td className="mono">{e.src}</td>
+                      <td className="mono">{e.agent_ip || '—'}</td>
                       <td className="mono hint">{e.oid}</td>
                     </tr>
                   );
                 })
               ) : (
                 <tr>
-                  <td colSpan={6} className="empty">
+                  <td colSpan={7} className="empty">
                     <Icon name="i-bell" size={24} /><p><b>{events.length ? 'ไม่มีเหตุการณ์ที่ตรงกับตัวกรอง' : 'ยังไม่ได้รับ Trap'}</b></p><p>{events.length ? 'ลองเปลี่ยนหรือล้างตัวกรอง' : 'ตั้งค่าอุปกรณ์ให้ส่ง Link up / down Trap มาที่เครื่องนี้'}</p>
                   </td>
                 </tr>

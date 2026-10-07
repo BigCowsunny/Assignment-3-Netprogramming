@@ -2,15 +2,10 @@ import React from 'react';
 import { useSnmp } from '../../context/SnmpContext';
 import { Icon } from '../common/Icons';
 import { fmtHM } from '../../utils/formatters';
+import { trapDeviceName } from '../../utils/trapEvents';
 
 export const LiveEventsCard: React.FC = () => {
   const { events, devices, setView } = useSnmp();
-
-  const getDeviceName = (devId: string) => {
-    if (devId === 'unknown') return 'Unknown Source';
-    const found = devices.find((d) => d.id === devId);
-    return found ? found.name : devId;
-  };
 
   const latestEvents = events.slice(0, 7);
 
@@ -29,7 +24,7 @@ export const LiveEventsCard: React.FC = () => {
             <div key={e.id} className="ev">
               <span className="t">{fmtHM(e.t)}</span>
               <span>
-                <b>{getDeviceName(e.dev)}</b>{' '}
+                <b>{trapDeviceName(e, devices)}</b>{' '}
                 <span className="where">· {e.port}</span>
               </span>
               {e.type === 'linkDown' ? (

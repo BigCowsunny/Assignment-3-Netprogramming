@@ -30,7 +30,7 @@ def device():
                  "ip": "127.0.0.1"}]}
 
 
-def packet(version=1, up=False, index=True):
+def packet(version=1, up=False, index=True, agent_ip="", agent_name=""):
     proto = api.v1 if version == 0 else api.v2c
     pdu = proto.TrapPDU() if version == 0 else proto.SNMPv2TrapPDU()
     helper = proto.apiTrapPDU if version == 0 else proto.apiPDU
@@ -41,9 +41,16 @@ def packet(version=1, up=False, index=True):
         values.insert(0, ("1.3.6.1.2.1.2.2.1.1.2", Integer32(2)))
     if version == 0:
         helper.set_generic_trap(pdu, 3 if up else 2)
+        # PySNMP defaults this field to a host interface; keep fixtures independent
+        # of the machine and use transport matching when identity is omitted.
+        helper.set_agent_address(pdu, agent_ip or "0.0.0.0")
     else:
         values.insert(0, (trap_receiver.OID_SNMP_TRAP_OID,
                           ObjectIdentifier(trap_receiver.OID_LINK_UP if up else trap_receiver.OID_LINK_DOWN)))
+        if agent_ip:
+            values.append(("1.3.6.1.6.3.18.1.3.0", api.v2c.IpAddress(agent_ip)))
+    if agent_name:
+        values.append(("1.3.6.1.2.1.1.5.0", OctetString(agent_name)))
     helper.set_varbinds(pdu, values)
     msg = proto.Message()
     proto.apiMessage.set_defaults(msg)

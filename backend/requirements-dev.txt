@@ -1,2 +1,4 @@
 -r requirements.txt
 httpx>=0.28,<1
+# Current Starlette TestClient uses httpx2; retain httpx for older releases.
+httpx2>=2.13,<3

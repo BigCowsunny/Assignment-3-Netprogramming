@@ -40,6 +40,8 @@
 
 ## Tests
 
+วิธีแก้ Trap ที่ชื่ออุปกรณ์เป็น Unknown เมื่อส่งผ่าน NAT/relay และตัวอย่าง config อยู่ใน [ชื่ออุปกรณ์ใน Trap](docs/TRAP_DEVICE_NAMES_TH.md)
+
 ```powershell
 python -m pip install -r backend/requirements-dev.txt
 python -m unittest discover -s tests -p "test_*.py" -v

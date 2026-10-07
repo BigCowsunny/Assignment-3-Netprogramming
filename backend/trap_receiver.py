@@ -17,6 +17,7 @@ from pysnmp.proto import api
 from database import add_audit_log, add_event, get_all_devices, save_device, update_interface_status
 from snmp_engine import snmp_get_system_info, snmp_walk_interfaces
 from device_types import classify_device
+from trap_identity import OID_TRAP_ADDRESS, match_trap_device, trap_identity
 
 logger = logging.getLogger("trap_receiver")
 
@@ -151,6 +152,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 return None
             pdu = proto.apiMessage.get_pdu(message)
             trap_oid = ""
+            agent_ip = ""
             if version == 0:
                 if pdu.tagSet != api.v1.TrapPDU.tagSet:
                     return None
@@ -158,18 +160,22 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 if generic not in (2, 3):
                     return None
                 trap_oid = OID_LINK_DOWN if generic == 2 else OID_LINK_UP
+                agent_ip = proto.apiTrapPDU.get_agent_address(pdu).prettyPrint()
                 varbinds = proto.apiTrapPDU.get_varbinds(pdu)
             else:
                 if pdu.tagSet != api.v2c.SNMPv2TrapPDU.tagSet:
                     return None
                 varbinds = proto.apiPDU.get_varbinds(pdu)
-            raw = {str(oid): str(value) for oid, value in varbinds}
+            raw = {str(oid): value.prettyPrint() if str(oid) == OID_TRAP_ADDRESS else str(value)
+                   for oid, value in varbinds}
+            agent_ip, agent_name = trap_identity(raw, agent_ip)
             if version == 1:
                 trap_oid = raw.get(OID_SNMP_TRAP_OID, "")
             if trap_oid not in (OID_LINK_DOWN, OID_LINK_UP):
                 return None
             result = {
                 "source_ip": src_ip, "community": str(proto.apiMessage.get_community(message)),
+                "agent_ip": agent_ip, "agent_name": agent_name,
                 "type": "linkDown" if trap_oid == OID_LINK_DOWN else "linkUp",
                 "oid": trap_oid, "if_index": None, "if_name": None, "admin": None,
                 "oper": "down" if trap_oid == OID_LINK_DOWN else "up", "raw": raw,
@@ -206,21 +212,17 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         trap_type = trap_data["type"]
         trap_oid = trap_data["oid"]
 
-        # Match device by IP in database
-        devices = get_all_devices()
-        matched_dev = None
-        for dev in devices:
-            addresses = {dev["ip"], *(port.get("ip", "") for port in dev.get("ports", []))}
-            if src_ip in addresses and not dev.get("discovery_only"):
-                matched_dev = dev
-                break
+        agent_ip, agent_name = trap_identity(trap_data.get("raw", {}),
+                                             trap_data.get("agent_ip", ""),
+                                             trap_data.get("agent_name", ""))
+        matched_dev = match_trap_device(get_all_devices(), src_ip, agent_ip, agent_name)
 
         device_id = matched_dev["id"] if matched_dev else "unknown"
-        device_name = matched_dev["name"] if matched_dev else src_ip
+        device_name = matched_dev["name"] if matched_dev else agent_name or "Unknown Source"
 
         # Determine port name
         port_name = trap_data["if_name"]
-        if matched_dev and trap_data["if_index"]:
+        if matched_dev and not matched_dev.get("discovery_only") and trap_data["if_index"]:
             for p in matched_dev.get("ports", []):
                 if p["idx"] == trap_data["if_index"]:
                     port_name = p["name"]
@@ -234,7 +236,7 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
 
         # Update interface oper status in DB if device is known
         new_oper = "down" if trap_type == "linkDown" else "up"
-        if matched_dev and port_name:
+        if matched_dev and not matched_dev.get("discovery_only") and port_name:
             update_interface_status(device_id, port_name, admin=trap_data.get("admin"), oper=new_oper)
 
         # Store in events table
@@ -245,7 +247,8 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
             port_name=port_name,
             trap_type=trap_type,
             oid=trap_oid,
-            raw_varbinds=json.dumps(trap_data.get("raw", {}))
+            raw_varbinds=json.dumps(trap_data.get("raw", {})),
+            agent_ip=agent_ip, agent_name=agent_name,
         )
 
         # Broadcast via WebSocket to all connected browser clients (FR-5.5, FR-5.6)
@@ -257,6 +260,9 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
                 "dev": device_id,
                 "dev_name": device_name,
                 "src": src_ip,
+                "agent_ip": agent_ip,
+                "agent_name": agent_name,
+                "if_index": trap_data.get("if_index"),
                 "port": port_name,
                 "type": trap_type,
                 "oid": trap_oid,
@@ -268,11 +274,17 @@ class SnmpTrapProtocol(asyncio.DatagramProtocol):
         await ws_manager.broadcast(ws_payload)
         # Record receipt immediately, even if the sender cannot be queried.
         # Trap community is not necessarily the device's read community.
-        if not matched_dev and src_ip not in ("127.0.0.1", "::1"):
+        target_ip = agent_ip or (matched_dev.get("ip") if matched_dev else "") or src_ip
+        if (not matched_dev or matched_dev.get("discovery_only")) and target_ip not in ("127.0.0.1", "::1"):
             try:
-                await asyncio.wait_for(_discover_from_trap(src_ip, trap_data.get("community", "")), timeout=8)
+                discovered = await asyncio.wait_for(_discover_from_trap(
+                    target_ip, (matched_dev or {}).get("community") or trap_data.get("community", "")), timeout=8)
+                if discovered:
+                    # Refresh the same stored event after enrollment; do not invent
+                    # another link event or replay its interface status.
+                    await ws_manager.broadcast({"type": "EVENTS_UPDATED"})
             except asyncio.TimeoutError:
-                logger.info("Trap recorded; sender %s could not be enrolled yet", src_ip)
+                logger.info("Trap recorded; sender %s could not be enrolled yet", target_ip)
 
 
 async def start_trap_listener(port: int = 162) -> asyncio.DatagramTransport:

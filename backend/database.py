@@ -12,6 +12,7 @@ import ipaddress
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from trap_identity import match_trap_device, trap_identity, trap_interface_index
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "snmp_monitor.db")
 
@@ -161,6 +162,10 @@ def init_db():
         PRIMARY KEY (observer_id, protocol, link_key));
     """)
     neighbor_columns = {row[1] for row in cursor.execute("PRAGMA table_info(discovered_neighbors)")}
+    event_columns = {row[1] for row in cursor.execute("PRAGMA table_info(events)")}
+    for column in ("agent_ip", "agent_name"):
+        if column not in event_columns:
+            cursor.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT DEFAULT ''")
     for column in ("device_identity", "chassis_id"):
         if column not in neighbor_columns:
             cursor.execute(f"ALTER TABLE discovered_neighbors ADD COLUMN {column} TEXT DEFAULT ''")
@@ -700,13 +705,15 @@ def update_interface_status(device_id: str, port_name: str, admin: Optional[str]
     conn.close()
 
 
-def add_event(evt_id: str, device_id: str, source_ip: str, port_name: str, trap_type: str, oid: str, raw_varbinds: str = ""):
+def add_event(evt_id: str, device_id: str, source_ip: str, port_name: str, trap_type: str, oid: str,
+              raw_varbinds: str = "", agent_ip: str = "", agent_name: str = ""):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT INTO events (id, timestamp, device_id, source_ip, port_name, type, oid, raw_varbinds)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (evt_id, datetime.now().isoformat(), device_id, source_ip, port_name, trap_type, oid, raw_varbinds))
+    INSERT INTO events (id, timestamp, device_id, source_ip, port_name, type, oid, raw_varbinds, agent_ip, agent_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (evt_id, datetime.now().isoformat(), device_id, source_ip, port_name, trap_type, oid,
+          raw_varbinds, agent_ip, agent_name))
     conn.commit()
     conn.close()
 
@@ -717,18 +724,38 @@ def get_events(limit: int = 100) -> List[Dict[str, Any]]:
     cursor.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT ?", (limit,))
     rows = cursor.fetchall()
     conn.close()
-    return [
-        {
+    devices = get_all_devices()
+    by_id = {device["id"]: device for device in devices}
+    events = []
+    for r in rows:
+        try:
+            raw = json.loads(r["raw_varbinds"] or "{}")
+            if not isinstance(raw, dict):
+                raw = {}
+        except (ValueError, TypeError):
+            raw = {}
+        agent_ip, agent_name = trap_identity(raw, r["agent_ip"], r["agent_name"])
+        matched = by_id.get(r["device_id"]) or match_trap_device(
+            devices, r["source_ip"], agent_ip, agent_name)
+        index = trap_interface_index(raw)
+        port_name = r["port_name"]
+        if matched and not matched.get("discovery_only") and index:
+            port_name = next((port["name"] for port in matched.get("ports", [])
+                              if port["idx"] == index), port_name)
+        events.append({
             "id": r["id"],
             "t": r["timestamp"],
-            "dev": r["device_id"],
+            "dev": matched["id"] if matched else r["device_id"],
+            "dev_name": matched["name"] if matched else agent_name or None,
             "src": r["source_ip"],
-            "port": r["port_name"],
+            "agent_ip": agent_ip,
+            "agent_name": agent_name,
+            "if_index": index,
+            "port": port_name,
             "type": r["type"],
             "oid": r["oid"],
-        }
-        for r in rows
-    ]
+        })
+    return events
 
 
 def add_audit_log(user: str, action: str, target: str, result: str):

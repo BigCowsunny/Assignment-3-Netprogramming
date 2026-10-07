@@ -13,6 +13,7 @@ import {
 } from '../types/snmp';
 import { runDiscoveryApi, DiscoveryProgress } from '../services/api';
 import { configurationWarning, escapeHtml, mergeDevices } from '../utils/deviceManagement';
+import { mergeTrapEvents, resolveTrapEvent } from '../utils/trapEvents';
 import {
   checkBackendHealth,
   fetchBackendHealth,
@@ -581,6 +582,11 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   useEffect(() => {
     if (!isRealtime || !isBackendConnected) return;
     let active = true;
+    const refreshEvents = () => {
+      void fetchEventsApi().then((rows: TrapEvent[]) => {
+        if (active) setEvents(previous => mergeTrapEvents(previous, rows));
+      }).catch(() => {});
+    };
     const socket = connectTrapWebSocket((message) => {
       if (message.type === 'TRAP_EVENT' && message.event) {
         const event = { ...message.event, t: new Date(message.event.t) } as TrapEvent;
@@ -592,6 +598,8 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           }));
         }
         addToast(event.type === 'linkDown' ? 'bad' : 'ok', event.type === 'linkDown' ? 'Link Down (SNMP Trap)' : 'Link Up (SNMP Trap)', `${event.src} · ${event.port}`);
+      } else if (message.type === 'EVENTS_UPDATED') {
+        refreshEvents();
       } else if (message.type === 'PORT_STATUS_CHANGE') {
         setDevices((prev) => prev.map((device) => device.id !== message.device_id ? device : {
           ...device,
@@ -618,17 +626,10 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
     }, () => {
       // Recover stored notifications received while the browser was disconnected.
-      void fetchEventsApi().then((rows) => {
-        if (!active) return;
-        setEvents(previous => {
-          const merged = new Map<string, TrapEvent>();
-          rows.forEach((row: TrapEvent) => merged.set(row.id, { ...row, t: new Date(row.t) }));
-          previous.forEach(row => merged.set(row.id, row));
-          return [...merged.values()].sort((a, b) => b.t.getTime() - a.t.getTime()).slice(0, 80);
-        });
-      }).catch(() => {});
+      refreshEvents();
     });
-    return () => { active = false; socket.close(); };
+    const timer = window.setInterval(refreshEvents, 15_000);
+    return () => { active = false; window.clearInterval(timer); socket.close(); };
   }, [isRealtime, isBackendConnected]);
 
   const connectBackend = async (): Promise<boolean> => {
@@ -643,7 +644,7 @@ export const SnmpProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         isBackendConnected,
         connectBackend,
         devices,
-        events,
+        events: events.map(event => resolveTrapEvent(event, devices)),
         auditLogs,
         view,
         selectedDeviceId,
